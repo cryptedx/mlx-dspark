@@ -203,7 +203,7 @@ struct ModelPill: View {
                     Button {
                         Task { await model.switchModel(to: row.target) }
                     } label: {
-                        if row.target == model.model {
+                        if model.isServerReady && row.target == model.model {
                             Label(row.shortTarget, systemImage: "checkmark")
                         } else {
                             Text(row.shortTarget)
@@ -211,14 +211,17 @@ struct ModelPill: View {
                     }
                 }
             }
-            let extras = model.installedModels.filter { !$0.isDrafter && $0.registryID == nil }
+            let measuredTargets = Set(model.models.filter(\.ready).map(\.target))
+            let extras = model.installedModels.filter {
+                !$0.isDrafter && !measuredTargets.contains($0.repo)
+            }
             if !extras.isEmpty {
                 Section("On this Mac") {
                     ForEach(extras) { installed in
                         Button {
                             Task { await model.switchModel(to: installed.repo) }
                         } label: {
-                            if installed.repo == model.model {
+                            if model.isServerReady && installed.repo == model.model {
                                 Label(installed.shortRepo, systemImage: "checkmark")
                             } else {
                                 Text(installed.shortRepo)
