@@ -438,7 +438,7 @@ public struct APIClient: Sendable {
         return try JSONDecoder().decode(LoadStatus.self, from: data)
     }
 
-    /// Download a model into the engine cache without loading it (`/admin/download`).
+    /// Download a target and its resolved drafter into the cache without loading either into memory (`/admin/download`).
     public func downloadModel(_ target: String) async throws {
         let body = try JSONSerialization.data(withJSONObject: ["model": target])
         var req = request("admin/download", method: "POST", body: body)

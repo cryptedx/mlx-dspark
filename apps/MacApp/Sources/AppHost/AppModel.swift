@@ -245,8 +245,8 @@ final class AppModel: ObservableObject {
     /// A model load/swap in flight (`/admin/load`). The window stays up; screens show
     /// progress inline and generation controls stay disabled via `isServerReady`.
     @Published var isModelLoading = false
-    /// A cache-only download in flight (`/admin/download`). It must not make the active model
-    /// look like it is loading or replace the chat loading state.
+    /// A cache-only model download in flight (`/admin/download`). It does not change the
+    /// resident model or consume model memory, and must not replace the chat loading state.
     @Published var isModelDownloading = false
     /// Live weight-download progress while a first-time load fetches from the hub
     /// (`/health.download`, polled during the load). Nil for cached models and old engines.
@@ -258,6 +258,8 @@ final class AppModel: ObservableObject {
     /// A cancel has been requested and the load is unwinding — disables the cancel buttons
     /// so a slow unwind can't collect duplicate requests.
     @Published var isCancellingLoad = false
+    /// Completion notice shown in the global status bar.
+    @Published var downloadNotice: String?
     /// One-time banner after onboarding: land in the Lab with the race ready to run.
     @Published var showLabWelcome = false
 
@@ -733,6 +735,8 @@ final class AppModel: ObservableObject {
         modelSwitchError = nil
         downloadError = nil
         isModelDownloading = true
+        downloadProgress = nil
+        downloadNotice = nil
         loadingDetail = "Downloading \(target)…"
         logStore.note("downloading model → \(target)")
         let poll = Task { [weak self] in
@@ -755,7 +759,10 @@ final class AppModel: ObservableObject {
         }
         do {
             try await client.downloadModel(target)
+            currentHealth = try? await client.health()
             await refreshDiagnostics()
+            let name = target.components(separatedBy: "/").last ?? target
+            downloadNotice = "\(name) downloaded — ready to load."
         } catch {
             let cancelled = error.localizedDescription.localizedCaseInsensitiveContains("cancelled")
             downloadError = cancelled ? nil : error.localizedDescription
@@ -807,17 +814,32 @@ final class AppModel: ObservableObject {
         modelSwitchError = failure
     }
 
-    /// Release the loaded model without loading another — frees its memory; the server, the
+    /// Release a resident model without loading another — frees its memory; the server, the
     /// port, and connected clients' base URLs all survive. `/admin/load` brings one back.
-    func unloadModel() async {
-        guard let client = apiClient, isSelectedModelResident,
-              !isModelLoading, !isModelDownloading else { return }
-        generationTask?.cancel()
-        resetModelRuntimeState()
-        logStore.note("unloading model")
-        _ = try? await client.unloadModel(model: model)
-        currentHealth = try? await client.health()
-        await refreshDiagnostics()
+    func unloadModel(_ target: String? = nil) async {
+        guard let client = apiClient, !isModelLoading, !isModelDownloading else { return }
+        let target = target ?? model
+        let usesPool = currentHealth?.pool != nil
+        let isResident = usesPool
+            ? poolStatus(for: target)?.ready == true
+            : target == model && isSelectedModelResident
+        guard isResident else { return }
+
+        let unloadingSelected = target == model
+        if unloadingSelected {
+            generationTask?.cancel()
+        }
+        modelSwitchError = nil
+        logStore.note("unloading model → \(target)")
+        do {
+            _ = try await client.unloadModel(model: target)
+            if unloadingSelected { resetModelRuntimeState() }
+            currentHealth = try? await client.health()
+            if unloadingSelected { await refreshDiagnostics() }
+        } catch {
+            currentHealth = try? await client.health()
+            modelSwitchError = error.localizedDescription
+        }
     }
 
     func setKeepLoaded(_ target: String, _ keepLoaded: Bool) async {

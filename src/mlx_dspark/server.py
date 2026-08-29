@@ -2135,19 +2135,23 @@ def make_handler(engine: Engine, api_key: str | None):
             except PoolError as error:
                 return self._send_pool_error(error)
 
+        @staticmethod
+        def _download_progress():
+            from .download import progress
+
+            return progress()
+
         def _pool_health(self) -> dict:
             status = engine.status()
             ready = [slot for slot in status["models"] if slot["state"] == "ready"]
             one = ready[0] if len(ready) == 1 else None
             phase = "ok" if ready else ("loading" if status["loading"] else "no_model")
             guard = getattr(engine.runtime, "memory_guard", None)
-            from .download import progress
-
             payload = {
                 "status": phase,
                 "model": one["model"] if one else None,
                 "loading": status["loading"],
-                "download": progress(),
+                "download": self._download_progress(),
                 "memory_guard": (guard.info() if guard is not None else {"enabled": False}),
                 "pool": status,
             }
@@ -2249,6 +2253,23 @@ def make_handler(engine: Engine, api_key: str | None):
             except PoolError as error:
                 return self._send_pool_error(error)
 
+        def _download(self, req: dict):
+            model = req.get("model")
+            if not isinstance(model, str) or not model.strip():
+                return self._send_error(400, "download needs a 'model' (repo or path)")
+            try:
+                _mode, target_repo, drafter_repo = resolve_mode(model)
+                from .download import ensure_local
+
+                ensure_local(target_repo)
+                if drafter_repo:
+                    ensure_local(drafter_repo)
+                return self._send_json(200, {"model": model, "downloaded": True})
+            except ValueError as error:
+                return self._send_error(400, str(error))
+            except Exception as error:  # noqa: BLE001 -- report network/auth/cache failures.
+                return self._send_error(502, f"download failed: {error}", "download_error")
+
         def _pool_unload(self, req: dict):
             all_models = req.get("all", False)
             if not isinstance(all_models, bool):
@@ -2309,20 +2330,18 @@ def make_handler(engine: Engine, api_key: str | None):
                         "phase": status.get("phase"),
                         # non-null while a first-time load is fetching weights:
                         # {repo, bytes_done, bytes_total} — cancel with /admin/load/cancel
-                        "download": status.get("download"),
+                        "download": status.get("download") or self._download_progress(),
                         # memory-pressure etc. — the OS-level warnings apply with no model too
                         "warnings": system_warnings(system_memory()),
                         "error": status["error"]})
                 # max_draft as a string ("auto" or the pinned/derived cap) so a client can
                 # show the configured knob, not just infer it from round telemetry.
-                from .download import progress
-
                 max_draft = ("auto" if getattr(engine, "cap_controller", None) is not None
                              else str(getattr(engine, "max_draft_tokens", None) or "auto"))
                 return self._send_json(200, {
                     "status": "ok", "model": engine.model_id, "mode": engine.mode,
                     "target": engine.target_repo, "drafter": engine.drafter_repo,
-                    "download": progress(),
+                    "download": self._download_progress(),
                     "max_draft": max_draft,
                     # resolved per pair at load (registry rows measured with lookup off carry
                     # it) — reported so a client shows the actual configuration, like max_draft
@@ -2499,24 +2518,11 @@ def make_handler(engine: Engine, api_key: str | None):
                     lambda: self._send_json(200, {"rounds": engine.rounds.snapshot(limit),
                                                   "stats": engine.rounds.stats()}))
             if route == "/events":
-                return self._model_operation(self._query_value("model"), self._events_stream)
+                # Telemetry is a passive observer, not a generation request. Holding a pool
+                # lease for this long-lived SSE stream made the last active model impossible
+                # to unload while the app's Lab subscriber was connected.
+                return self._events_stream()
             return self._send_error(404, f"unknown route {self.path}", "not_found")
-
-        def _download(self, req: dict):
-            """Download a model into the local cache without loading it."""
-            model = req.get("model")
-            if not isinstance(model, str) or not model.strip():
-                return self._send_error(400, "download needs a 'model' (repo or path)")
-            model = model.strip()
-            try:
-                from .download import ensure_local
-
-                ensure_local(model)
-            except Exception as e:  # noqa: BLE001 — report download failures to the client
-                traceback.print_exc()
-                return self._send_error(500, f"could not download {model!r}: "
-                                             f"{type(e).__name__}: {e}", "api_error")
-            return self._send_json(200, {"model": model, "downloaded": True})
 
         def _load(self, req: dict):
             """Swap the loaded model in place, keeping the server and its port.
@@ -2752,8 +2758,11 @@ def make_handler(engine: Engine, api_key: str | None):
             # model swap, during which the holder has no engine and every attribute access
             # raises. Holding the log object keeps subscribe/unsubscribe paired on the same
             # log no matter what the holder does meanwhile.
+            requested_model = self._query_value("model")
             try:
-                log = engine.rounds
+                log = (engine.telemetry_log(requested_model) if is_pool else engine.rounds)
+            except PoolError as error:
+                return self._send_pool_error(error)
             except RuntimeError:
                 return self._send_error(503, "no model is loaded (a model swap is in "
                                              "progress or failed)", "server_error")
@@ -2780,9 +2789,11 @@ def make_handler(engine: Engine, api_key: str | None):
                         # then watching a dead object. End it so the client reconnects to
                         # the new engine's stream instead of going silent forever.
                         try:
-                            if engine.rounds is not log:
-                                break
-                        except RuntimeError:
+                            current_log = (engine.telemetry_log(requested_model)
+                                            if is_pool else engine.rounds)
+                        except (PoolError, RuntimeError):
+                            break                     # model unloaded or swap in progress
+                        if current_log is not log:
                             break                     # swap in progress — same conclusion
                         if idle >= 15.0:
                             self._sse(log.stats(), "stats")

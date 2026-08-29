@@ -195,47 +195,10 @@ struct CheckForUpdatesButton: View {
 /// Current model + one-click hot swap, from anywhere.
 struct ModelPill: View {
     @EnvironmentObject private var model: AppModel
+    @State private var isPresented = false
 
     var body: some View {
-        Menu {
-            Section("Measured pairs") {
-                ForEach(model.models.filter(\.ready)) { row in
-                    Button {
-                        Task { await model.switchModel(to: row.target) }
-                    } label: {
-                        if model.isServerReady && row.target == model.model {
-                            Label(row.shortTarget, systemImage: "checkmark")
-                        } else {
-                            Text(row.shortTarget)
-                        }
-                    }
-                }
-            }
-            let measuredTargets = Set(model.models.filter(\.ready).map(\.target))
-            let extras = model.installedModels.filter {
-                !$0.isDrafter && !measuredTargets.contains($0.repo)
-            }
-            if !extras.isEmpty {
-                Section("On this Mac") {
-                    ForEach(extras) { installed in
-                        Button {
-                            Task { await model.switchModel(to: installed.repo) }
-                        } label: {
-                            if model.isServerReady && installed.repo == model.model {
-                                Label(installed.shortRepo, systemImage: "checkmark")
-                            } else {
-                                Text(installed.shortRepo)
-                            }
-                        }
-                    }
-                }
-            }
-            Divider()
-            if model.isServerReady {
-                Button("Unload selected model") { Task { await model.unloadModel() } }
-            }
-            Button("All models…") { model.screen = .models }
-        } label: {
+        Button { isPresented.toggle() } label: {
             HStack(spacing: 6) {
                 if model.isModelLoading || model.isModelDownloading {
                     ProgressView().controlSize(.mini)
@@ -247,9 +210,17 @@ struct ModelPill: View {
                 Text(title)
                     .font(.callout.weight(.medium))
                     .lineLimit(1)
+                Image(systemName: "chevron.down")
+                    .font(.caption.weight(.semibold))
             }
+            .padding(.horizontal, 10)
+            .padding(.vertical, 6)
         }
-        .menuIndicator(.visible)
+        .buttonStyle(.plain)
+        .popover(isPresented: $isPresented, arrowEdge: .top) {
+            ModelSelectorPopover(dismiss: { isPresented = false })
+                .environmentObject(model)
+        }
         .help("Switch model — the server and its port stay up")
     }
 
@@ -261,6 +232,207 @@ struct ModelPill: View {
             return "Loading \(model.model.components(separatedBy: "/").last ?? model.model)…"
         }
         return model.activeModelName ?? "No model — choose"
+    }
+}
+
+private struct ModelSelectorPopover: View {
+    @EnvironmentObject private var model: AppModel
+    let dismiss: () -> Void
+
+    private var loaded: [PoolModelStatus] {
+        model.poolModelStatuses.filter(\.ready)
+    }
+
+    private var loadedIDs: Set<String> {
+        Set(loaded.flatMap { [$0.model, $0.target].compactMap { $0 } })
+    }
+
+    private var availableInstalled: [InstalledModel] {
+        model.installedModels.filter {
+            !$0.isDrafter && !loadedIDs.contains($0.repo) && !isResident($0.repo)
+        }
+    }
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 10) {
+            VStack(alignment: .leading, spacing: 2) {
+                Text("Models").font(.headline)
+                Text("Choose a model or manage memory directly.")
+                    .font(.caption).foregroundStyle(.secondary)
+            }
+
+            if !loaded.isEmpty {
+                Text("Loaded now")
+                    .font(.caption.weight(.semibold))
+                    .foregroundStyle(.secondary)
+                ForEach(loaded) { status in
+                    loadedRow(status)
+                }
+            } else if model.isServerReady {
+                Text("Loaded now")
+                    .font(.caption.weight(.semibold))
+                    .foregroundStyle(.secondary)
+                legacyLoadedRow
+            }
+
+            if !availableInstalled.isEmpty {
+                Text("On this Mac")
+                    .font(.caption.weight(.semibold))
+                    .foregroundStyle(.secondary)
+                    .padding(.top, 4)
+                ForEach(availableInstalled) { installed in
+                    loadRow(installed.shortRepo, target: installed.repo)
+                }
+            }
+
+            if loaded.isEmpty && availableInstalled.isEmpty {
+                Text("No downloaded models yet.")
+                    .font(.callout).foregroundStyle(.secondary)
+            }
+
+            Divider().padding(.top, 2)
+            Button {
+                dismiss()
+                model.screen = .models
+            } label: {
+                Label("Manage models…", systemImage: "slider.horizontal.3")
+                    .font(.callout.weight(.medium))
+            }
+            .buttonStyle(.plain)
+        }
+        .padding(14)
+        .frame(width: 390)
+    }
+
+    private func loadedRow(_ status: PoolModelStatus) -> some View {
+        let target = status.target ?? status.model
+        let active = model.isServerReady
+            && (status.model == model.model || status.target == model.model)
+        return ModelSelectorRow(
+            name: shortName(status.model),
+            active: active,
+            primaryTitle: active ? nil : "Use",
+            primarySymbol: "arrow.right.circle",
+            primaryAction: {
+                dismiss()
+                Task { await model.switchModel(to: target) }
+            },
+            secondaryTitle: "Unload",
+            secondarySymbol: "eject",
+            secondaryAction: {
+                dismiss()
+                Task { await model.unloadModel(status.model) }
+            }
+        )
+    }
+
+    private var legacyLoadedRow: some View {
+        ModelSelectorRow(
+            name: model.activeModelName ?? shortName(model.model),
+            active: true,
+            primaryTitle: nil,
+            primarySymbol: "",
+            primaryAction: {},
+            secondaryTitle: "Unload",
+            secondarySymbol: "eject",
+            secondaryAction: {
+                dismiss()
+                Task { await model.unloadModel() }
+            }
+        )
+    }
+
+    private func loadRow(_ name: String, target: String) -> some View {
+        ModelSelectorRow(
+            name: name,
+            active: false,
+            primaryTitle: "Load",
+            primarySymbol: "arrow.down.circle",
+            primaryAction: {
+                dismiss()
+                Task { await model.switchModel(to: target) }
+            }
+        )
+    }
+
+    private func shortName(_ model: String) -> String {
+        model.components(separatedBy: "/").last ?? model
+    }
+
+    private func isResident(_ target: String) -> Bool {
+        model.poolStatus(for: target)?.ready == true
+            || (model.isServerReady && target == model.model)
+    }
+}
+
+private struct ModelSelectorRow: View {
+    @EnvironmentObject private var model: AppModel
+    let name: String
+    let active: Bool
+    let primaryTitle: String?
+    let primarySymbol: String
+    let primaryAction: () -> Void
+    var secondaryTitle: String? = nil
+    var secondarySymbol: String = ""
+    var secondaryAction: () -> Void = {}
+
+    var body: some View {
+        HStack(spacing: 8) {
+            Image(systemName: active ? "checkmark.circle.fill" : "circle")
+                .foregroundStyle(active ? Theme.spark : .secondary)
+                .imageScale(.small)
+            Text(name)
+                .font(.callout)
+                .lineLimit(1)
+                .truncationMode(.middle)
+            Spacer(minLength: 4)
+            if let primaryTitle {
+                ActionPill(title: primaryTitle, systemImage: primarySymbol,
+                           prominent: primaryTitle == "Load") {
+                    primaryAction()
+                }
+            }
+            if let secondaryTitle {
+                ActionPill(title: secondaryTitle, systemImage: secondarySymbol) {
+                    secondaryAction()
+                }
+            }
+        }
+        .padding(.horizontal, 8)
+        .padding(.vertical, 7)
+        .background(active ? Theme.spark.opacity(0.10) : .clear,
+                    in: RoundedRectangle(cornerRadius: Theme.controlRadius, style: .continuous))
+        .disabled(model.isModelLoading || model.isModelDownloading)
+    }
+}
+
+private struct ActionPill: View {
+    let title: String
+    let systemImage: String
+    var prominent = false
+    let action: () -> Void
+
+    var body: some View {
+        Button(action: action) {
+            Label(title, systemImage: systemImage)
+                .font(.caption.weight(.semibold))
+                .padding(.horizontal, 8)
+                .padding(.vertical, 5)
+                .foregroundStyle(prominent ? Theme.spark : .primary)
+                .background(prominent
+                            ? AnyShapeStyle(Theme.spark.opacity(0.14))
+                            : AnyShapeStyle(.quaternary),
+                            in: RoundedRectangle(cornerRadius: Theme.controlRadius,
+                                                 style: .continuous))
+                .overlay(RoundedRectangle(cornerRadius: Theme.controlRadius, style: .continuous)
+                    .strokeBorder(
+                    prominent
+                        ? AnyShapeStyle(Theme.spark.opacity(0.42))
+                        : AnyShapeStyle(.separator.opacity(0.5)),
+                    lineWidth: 1))
+        }
+        .buttonStyle(.plain)
+        .focusEffectDisabled()
     }
 }
 
@@ -428,7 +600,28 @@ struct StatusBar: View {
 
     var body: some View {
         HStack(spacing: 10) {
-            if let progress = model.prefillProgress {
+            if model.isModelDownloading {
+                if let progress = model.downloadProgress, let fraction = progress.fraction {
+                    ProgressView(value: fraction)
+                        .progressViewStyle(.linear)
+                        .tint(Theme.spark)
+                        .frame(width: 120)
+                        .accessibilityLabel("Download progress")
+                        .accessibilityValue("\(Int(fraction * 100)) percent")
+                    Text("Download \(Int(fraction * 100))%")
+                        .font(.caption.monospacedDigit())
+                } else {
+                    ProgressView().controlSize(.small)
+                    Text("Downloading…")
+                        .font(.caption)
+                }
+                Text(model.downloadProgress?.repo.components(separatedBy: "/").last ?? "model")
+                    .font(.caption)
+                    .lineLimit(1).truncationMode(.middle)
+            } else if let notice = model.downloadNotice {
+                Image(systemName: "checkmark.circle.fill").foregroundStyle(Theme.verified)
+                Text(notice).font(.caption).lineLimit(1).truncationMode(.middle)
+            } else if let progress = model.prefillProgress {
                 ProgressView(value: progress.fraction)
                     .progressViewStyle(.linear)
                     .tint(Theme.spark)

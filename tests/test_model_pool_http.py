@@ -11,8 +11,11 @@ from http.server import ThreadingHTTPServer
 
 import pytest
 
+from mlx_dspark import download as download_module
+from mlx_dspark import server as server_module
 from mlx_dspark.model_pool import ModelPool, PreparedModel
 from mlx_dspark.server import make_handler
+from mlx_dspark.telemetry import RoundLog
 
 
 class _Executor:
@@ -60,6 +63,9 @@ class _Engine:
         kv_bits = 8
 
     target = _Target()
+
+    def __init__(self):
+        self.rounds = RoundLog()
 
     def close(self):
         return None
@@ -149,3 +155,36 @@ def test_pool_metrics_acquires_model_by_query_parameter(pool_server):
     assert status == 200
     slot = health["pool"]["models"][0]
     assert slot["model"] == "org/One" and slot["leases"] == 0
+
+
+def test_download_endpoint_only_caches_the_model(monkeypatch, pool_server):
+    pool, base = pool_server
+    downloaded = []
+    monkeypatch.setattr(server_module, "resolve_mode",
+                        lambda model: ("lookup", model, None))
+    monkeypatch.setattr(download_module, "ensure_local",
+                        lambda repo: downloaded.append(repo))
+
+    status, body = _request(base, "/admin/download", "POST", {"model": "org/One"})
+
+    assert status == 200 and body["downloaded"] is True
+    assert downloaded == ["org/One"]
+    assert pool.status()["models"] == []
+
+
+def test_pool_events_stream_does_not_block_unload(pool_server):
+    _pool, base = pool_server
+    assert _request(base, "/admin/load", "POST", {"model": "org/One"})[0] == 200
+
+    stream = urllib.request.urlopen(base + "/events?model=org/One", timeout=5)
+    try:
+        assert stream.readline() == b"event: stats\n"
+        status, health = _request(base, "/health")
+        assert status == 200
+        assert health["pool"]["models"][0]["leases"] == 0
+
+        status, body = _request(base, "/admin/unload", "POST", {"model": "org/One"})
+        assert status == 200
+        assert body["models"] == []
+    finally:
+        stream.close()
