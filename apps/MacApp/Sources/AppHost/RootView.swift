@@ -241,7 +241,7 @@ struct ModelPill: View {
                     ProgressView().controlSize(.mini)
                 } else {
                     Circle()
-                        .fill(model.isServerReady ? Theme.verified : Theme.warning)
+                        .fill(model.hasLoadedModel ? Theme.verified : Theme.warning)
                         .frame(width: 7, height: 7)
                 }
                 Text(title)
@@ -257,7 +257,7 @@ struct ModelPill: View {
         if model.isModelLoading {
             return "Loading \(model.model.components(separatedBy: "/").last ?? model.model)…"
         }
-        return model.health?.model ?? "No model — choose"
+        return model.activeModelName ?? "No model — choose"
     }
 }
 
@@ -276,12 +276,12 @@ struct SidebarFooter: View {
                     ProgressView().controlSize(.mini)
                 } else {
                     Circle()
-                        .fill(model.isServerReady ? Theme.verified : Theme.warning)
+                        .fill(model.hasLoadedModel ? Theme.verified : Theme.warning)
                         .frame(width: 6, height: 6)
                 }
                 Text(model.isModelLoading
                      ? "Loading \(model.model.components(separatedBy: "/").last ?? model.model)…"
-                     : model.health?.model ?? "No model")
+                     : model.activeModelName ?? "No model")
                     .font(.caption).lineLimit(1).truncationMode(.middle)
             }
             if model.liveTokensPerSec > 0 {

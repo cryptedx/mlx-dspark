@@ -333,10 +333,11 @@ class _Penalizer:
 
 
 class StopStreaming(Exception):
-    """Raise from an ``on_text`` callback to end generation gracefully: the loop stops at
-    the next round boundary and returns a normal (partial) GenResult, leaving caches in a
-    consistent, storable state. The server uses this when a streaming client disconnects,
-    so the prefix cache survives instead of being invalidated by an error."""
+    """Stop work at a safe generation boundary after a streaming client disconnects.
+
+    Decode catches this from ``on_text`` and returns a normal partial result; prefill lets it
+    reach the server after the current evaluated prompt chunk so partial caches are discarded.
+    """
 
 
 class _FullDecodeDetokenizer:

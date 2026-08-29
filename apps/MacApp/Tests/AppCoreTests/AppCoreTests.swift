@@ -201,6 +201,23 @@ struct HealthInfoTests {
         #expect(health.contextWindow == nil)
         #expect(health.cpuSplit == nil)
     }
+
+    @Test func keepsTheSelectedModelVisibleInATwoSlotPool() throws {
+        let json = #"""
+        {"status":"ok","model":null,"pool":{"ready":true,"loading":false,
+        "model":null,"error":null,"max_resident_models":2,"idle_ttl_seconds":900,
+        "models":[
+          {"model":"vendor/aux","state":"ready","ready":true,"pinned":false,
+           "leases":0,"profile_pending_reload":false,"mode":"lookup","target":"vendor/aux"},
+          {"model":"vendor/selected","state":"ready","ready":true,"pinned":true,
+           "leases":1,"profile_pending_reload":false,"mode":"dspark","target":"vendor/selected"}
+        ]}}
+        """#
+        let health = try JSONDecoder().decode(HealthInfo.self, from: Data(json.utf8))
+        #expect(health.model == nil)
+        #expect(health.hasLoadedModel)
+        #expect(health.readyPoolModel(preferred: "vendor/selected")?.model == "vendor/selected")
+    }
 }
 
 @Suite("Install locations")

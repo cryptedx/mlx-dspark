@@ -176,9 +176,8 @@ final class AppModel: ObservableObject {
     /// This Mac vs the reference M4 Pro the registry badges were measured on (`/admin/models`).
     @Published var bandwidth: BandwidthInfo?
 
-    /// The loaded model's self-description. Fetched from `/health` on start and after every hot
-    /// swap, so it stays correct across a model change — the supervisor's own cached health
-    /// only reflects the model the process *started* with, not one swapped in later.
+    /// The loaded model's self-description. Fetched from `/health` on start, after app-driven
+    /// swaps, and while the app runs, so Hermes-driven pool changes stay visible too.
     @Published var currentHealth: HealthInfo?
 
     // MARK: Models
@@ -292,6 +291,7 @@ final class AppModel: ObservableObject {
     private(set) var apiClient: APIClient?
     private var client: APIClient? { apiClient }
     private var generationTask: Task<Void, Never>?
+    private var healthTask: Task<Void, Never>?
     private var telemetryTask: Task<Void, Never>?
     private var memoryTask: Task<Void, Never>?
     private var idleDecayTask: Task<Void, Never>?
@@ -485,6 +485,11 @@ final class AppModel: ObservableObject {
     /// import, no weights). Returns false after calling `fail()` when even that can't start.
     private func spawnServer(preserving settings: ModelSettings? = nil) async -> Bool {
         guard let engine = engineURL else { return false }
+        healthTask?.cancel()
+        healthTask = nil
+        apiClient = nil
+        currentHealth = nil
+        resetModelRuntimeState()
         phase = .startingServer
         let supervisor = ServerSupervisor(engine: engine, logStore: logStore)
         self.supervisor = supervisor
@@ -539,7 +544,56 @@ final class AppModel: ObservableObject {
                                apiKey: Defaults.effectiveAPIKey)
         self.apiClient = client
         currentHealth = try? await client.health()
+        startHealthPolling()
         return true
+    }
+
+    /// Hermes and other clients can load or unload pool slots without calling AppModel. Keep
+    /// the app's snapshot honest through the same local `/health` endpoint the supervisor uses.
+    private func startHealthPolling() {
+        healthTask?.cancel()
+        guard let client else { return }
+        healthTask = Task { [weak self] in
+            while !Task.isCancelled {
+                guard let self else { return }
+                if let health = try? await client.health() {
+                    self.applyHealthUpdate(health)
+                }
+                try? await Task.sleep(nanoseconds: 1_000_000_000)
+            }
+        }
+    }
+
+    private func applyHealthUpdate(_ health: HealthInfo) {
+        let hadLoadedModel = hasLoadedModel
+        let wasSelectedResident = isSelectedModelResident
+        currentHealth = health
+        let isSelectedResident = isSelectedModelResident
+        if isSelectedResident && !wasSelectedResident {
+            startTelemetry()
+            startMemoryPolling()
+        } else if (wasSelectedResident && !isSelectedResident)
+                    || (hadLoadedModel && !hasLoadedModel) {
+            resetModelRuntimeState()
+        }
+    }
+
+    private func resetModelRuntimeState() {
+        telemetryTask?.cancel()
+        telemetryTask = nil
+        memoryTask?.cancel()
+        memoryTask = nil
+        idleDecayTask?.cancel()
+        idleDecayTask = nil
+        prefillProgress = nil
+        rounds = []
+        stats = nil
+        calibration = nil
+        memory = nil
+        machine = nil
+        liveTokensPerSec = 0
+        rateEWMA = 0
+        lastActivity = .distantPast
     }
 
     private func registerSavedProfiles(selected: String, preserving: ModelSettings?) async {
@@ -705,12 +759,7 @@ final class AppModel: ObservableObject {
     func unloadModel() async {
         guard let client = apiClient, isSelectedModelResident else { return }
         generationTask?.cancel()
-        prefillProgress = nil
-        rounds = []
-        stats = nil
-        calibration = nil
-        memory = nil
-        liveTokensPerSec = 0
+        resetModelRuntimeState()
         logStore.note("unloading model")
         _ = try? await client.unloadModel(model: model)
         currentHealth = try? await client.health()
@@ -834,6 +883,7 @@ final class AppModel: ObservableObject {
 
     func shutdown() async {
         generationTask?.cancel()
+        healthTask?.cancel()
         telemetryTask?.cancel()
         memoryTask?.cancel()
         idleDecayTask?.cancel()
@@ -1193,6 +1243,25 @@ final class AppModel: ObservableObject {
         poolModelStatuses.first { $0.model == target || $0.target == target }
     }
 
+    /// The selected ready slot when possible; otherwise the one model currently serving.
+    /// `/health.model` is intentionally nil when a two-slot pool is full.
+    var activePoolStatus: PoolModelStatus? {
+        health?.readyPoolModel(preferred: model)
+    }
+
+    var hasLoadedModel: Bool { health?.hasLoadedModel ?? false }
+
+    var activeModelName: String? {
+        guard let model = activePoolStatus?.model else { return health?.model }
+        return model.components(separatedBy: "/").last ?? model
+    }
+
+    var activeModelMode: String? { activePoolStatus?.mode ?? health?.mode }
+    var activeModelTarget: String? {
+        activePoolStatus?.target ?? activePoolStatus?.model ?? health?.target
+    }
+    var activeModelDrafter: String? { activePoolStatus?.drafter ?? health?.drafter }
+
     /// The selected target is actually resident and able to serve. This remains narrower than
     /// `isServerRunning` for diagnostics, decoder settings, and the explicit unload control.
     var isSelectedModelResident: Bool {
@@ -1210,7 +1279,7 @@ final class AppModel: ObservableObject {
     /// need only the target; a drafter mode needs the drafter this engine was loaded with, so
     /// dspark and dflash are never both on offer.
     var availableRaceArms: [String] {
-        guard let mode = health?.mode else { return ["baseline", "lookup"] }
+        guard let mode = activeModelMode else { return ["baseline", "lookup"] }
         return mode == "dspark" || mode == "dflash"
             ? [mode, "baseline", "lookup"] : ["baseline", "lookup"]
     }
@@ -1225,7 +1294,7 @@ final class AppModel: ObservableObject {
         if let row = loadedModelRow {
             if row.dsparkDrafter != nil { options.append("dspark") }
             if row.dflashDrafter != nil { options.append("dflash") }
-        } else if let mode = health?.mode, mode == "dspark" || mode == "dflash" {
+        } else if let mode = activeModelMode, mode == "dspark" || mode == "dflash" {
             // Unregistered pair running with an explicit drafter: keep its mode on offer.
             options.append(mode)
         }
@@ -1238,7 +1307,7 @@ final class AppModel: ObservableObject {
     /// longest id first — so a local path like `…/models/Qwen3.8-27B-8bit` still finds its
     /// row and the Decoding picker keeps offering the pair's drafter mode.
     private var loadedModelRow: ModelRow? {
-        guard let target = health?.target else { return nil }
+        guard let target = activeModelTarget else { return nil }
         let base = (target as NSString).lastPathComponent.lowercased()
         let baseNoDash = base.replacingOccurrences(of: "-", with: "")
         return models
@@ -1253,8 +1322,8 @@ final class AppModel: ObservableObject {
         switch serverState {
         case .idle:                 return "Idle"
         case .starting(let detail): return detail
-        case .ready(let port, let health):
-            guard let name = health.model, let mode = health.mode else {
+        case .ready(let port, _):
+            guard let name = activeModelName, let mode = activeModelMode else {
                 return "No model loaded · :\(port)"
             }
             return "\(name) · \(mode) · :\(port)"
@@ -1265,7 +1334,7 @@ final class AppModel: ObservableObject {
 
     /// "Running dspark · cap 4" — what the decode knobs are currently doing.
     var decodingLine: String {
-        var line = "Running \(health?.mode ?? "—")"
+        var line = "Running \(activeModelMode ?? "—")"
         if let cap = health?.maxDraft { line += " · cap \(cap)" }
         return line
     }
@@ -1273,8 +1342,8 @@ final class AppModel: ObservableObject {
     /// "target ← drafter" — the pairing that makes speculative decoding work. Naming both is
     /// something no other local-LLM app has to do, so it belongs in the chrome, not a submenu.
     var pairingLine: String? {
-        guard let health, let drafter = health.drafter,
-              let name = health.target ?? health.model else { return nil }
+        guard let drafter = activeModelDrafter,
+              let name = activeModelTarget ?? activeModelName else { return nil }
         let short = { (repo: String) in repo.components(separatedBy: "/").last ?? repo }
         return "\(short(name))  ←  \(short(drafter))"
     }
@@ -1282,7 +1351,7 @@ final class AppModel: ObservableObject {
     /// The loaded model's resident footprint, ready for the chrome. Peak is deliberately not
     /// shown here — a gauge that never goes down reads as a leak.
     var memoryLine: String? {
-        guard let gb = memory?.activeGB, gb > 0.05 else { return nil }
+        guard hasLoadedModel, let gb = memory?.activeGB, gb > 0.05 else { return nil }
         return String(format: "%.1f GB", gb)
     }
 

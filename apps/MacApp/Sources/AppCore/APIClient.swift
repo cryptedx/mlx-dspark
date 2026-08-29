@@ -135,6 +135,22 @@ public struct HealthInfo: Decodable, Sendable, Equatable {
     public var isLoaded: Bool { status == "ok" }
 }
 
+public extension HealthInfo {
+    /// A pool deliberately has no implicit current model once two slots are resident. Prefer
+    /// the app's selected target, then fall back to any serving slot for status UI.
+    func readyPoolModel(preferred target: String) -> PoolModelStatus? {
+        guard let pool else { return nil }
+        return pool.models.first {
+            $0.ready && ($0.model == target || $0.target == target)
+        } ?? pool.models.first(where: \.ready)
+    }
+
+    /// Unlike the top-level `model`, this remains true when more than one pool slot is ready.
+    var hasLoadedModel: Bool {
+        pool?.models.contains(where: \.ready) ?? isLoaded
+    }
+}
+
 /// A first-time model download in flight, as `/health` reports it while loading.
 /// `bytesTotal` is best-effort (hub metadata) and may be nil for the first seconds.
 public struct DownloadProgress: Decodable, Sendable, Equatable {

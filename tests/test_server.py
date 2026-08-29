@@ -55,7 +55,7 @@ class _FakeEngine:
 
     def generate(self, prompt_ids, *, max_tokens, temperature, top_p=1.0, top_k=0,
                  presence_penalty=0.0, frequency_penalty=0.0, logprobs=None,
-                 stop, seed, on_text=None):
+                 stop, seed, on_text=None, check_cancel=None):
         self.calls.append({"prompt_ids": prompt_ids, "max_tokens": max_tokens,
                                "temperature": temperature, "top_p": top_p, "top_k": top_k,
                                "presence_penalty": presence_penalty,
@@ -1065,6 +1065,59 @@ def test_plain_chat_stream_stops_generation_when_client_disconnects(monkeypatch)
         assert eng.stopped_early
     finally:
         httpd.shutdown()
+
+
+def test_plain_chat_stream_stops_during_prefill_when_client_disconnects(monkeypatch):
+    """A dead client cancels at the next evaluated prompt chunk, before decode starts."""
+    monkeypatch.setattr(S, "STREAM_KEEPALIVE_S", 0.03)
+    monkeypatch.setattr(S, "swap_usage", lambda: {"used_bytes": 0})
+
+    class QuietPrefillEngine(_FakeEngine):
+        generate = S.Engine.generate
+        _generate_impl = S.Engine._generate_impl
+        _generate_impl_inner = S.Engine._generate_impl_inner
+        _with_slow_round_log = S.Engine._with_slow_round_log
+
+    eng = QuietPrefillEngine()
+    eng.mode = "baseline"
+    eng.target = object()
+    eng.prefix = eng.memory_guard = eng._depth_capper = None
+    eng.max_draft_tokens = None
+    eng.warmup_enabled = True
+    eng.stats = {"requests": 0}
+    eng.rounds = S.RoundLog()
+    eng.finished = threading.Event()
+    eng.prefill_chunks = 0
+    eng._executor = S.ThreadPoolExecutor(max_workers=1)
+
+    def quiet_prefill(*_args, on_prefill_progress, **_kwargs):
+        try:
+            for pos in range(1, 401):
+                time.sleep(0.01)
+                eng.prefill_chunks = pos
+                on_prefill_progress(pos)
+        finally:
+            eng.finished.set()
+        pytest.fail("disconnected prefill ran to completion")
+
+    monkeypatch.setattr(S, "greedy_generate", quiet_prefill)
+    httpd = ThreadingHTTPServer(("127.0.0.1", 0), S.make_handler(eng, api_key=None))
+    threading.Thread(target=httpd.serve_forever, daemon=True).start()
+    try:
+        host, port = httpd.server_address
+        body = json.dumps({"messages": [{"role": "user", "content": "hi"}],
+                           "stream": True})
+        with socket.create_connection((host, port)) as s:
+            s.sendall((f"POST /v1/chat/completions HTTP/1.1\r\nHost: {host}\r\n"
+                       f"Content-Type: application/json\r\n"
+                       f"Content-Length: {len(body)}\r\n\r\n{body}").encode())
+            s.recv(4096)
+        assert eng.finished.wait(5.0)
+        assert eng.prefill_chunks < 400
+    finally:
+        httpd.shutdown()
+        httpd.server_close()
+        eng._executor.shutdown(wait=True)
 
 
 # ------------------------------------------------- issue #14: RAM-aware context warning

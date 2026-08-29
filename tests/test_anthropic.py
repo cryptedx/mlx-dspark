@@ -644,7 +644,7 @@ class _FakeEngine:
 
     def generate(self, prompt_ids, *, max_tokens, temperature, top_p=1.0, top_k=0,
                  presence_penalty=0.0, frequency_penalty=0.0, logprobs=None,
-                 stop=None, seed=None, on_text=None):
+                 stop=None, seed=None, on_text=None, check_cancel=None):
         self.calls.append({"prompt_ids": prompt_ids, "max_tokens": max_tokens,
                                "temperature": temperature, "top_p": top_p, "top_k": top_k,
                                "stop": stop, "seed": seed})

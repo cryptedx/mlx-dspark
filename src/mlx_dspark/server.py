@@ -75,8 +75,8 @@ MODES = ("dspark", "dflash", "lookup", "baseline")
 # from aborting through stretches with nothing on the wire (long prefill; the buffered
 # tool-calls path emits nothing until generation finishes), and — because a failed
 # keep-alive write is the only way to notice a vanished client while nothing streams —
-# detecting disconnects so generation stops at the next round instead of grinding to
-# max_tokens on the single MLX thread with nobody listening. Issue #14: abandoned
+# detecting disconnects so generation stops at the next prompt chunk or decode round instead
+# of grinding to max_tokens on the single MLX thread with nobody listening. Issue #14: abandoned
 # generations piling up behind that thread is exactly what looked like a wedged server.
 # Env-overridable for aggressive proxies (and for exercising the path without a 15 s wait).
 STREAM_KEEPALIVE_S = float(os.environ.get("MLX_DSPARK_STREAM_KEEPALIVE_S", "") or 15.0)
@@ -845,11 +845,13 @@ class Engine:
         stop: list[str] | None,
         seed: int | None,
         on_text=None,
+        check_cancel=None,
     ) -> GenResult:
         # hop onto the single generation thread (keeps all MLX/cache work same-thread)
         return self._executor.submit(
             self._generate_impl, prompt_ids, max_tokens, temperature, top_p, top_k,
-            stop, seed, on_text, presence_penalty, frequency_penalty, logprobs).result()
+            stop, seed, on_text, presence_penalty, frequency_penalty, logprobs,
+            check_cancel).result()
 
     def _with_slow_round_log(self, inner, n_prompt: int):
         """Wrap a per-round callback with a stall detector: any gap over
@@ -885,7 +887,7 @@ class Engine:
 
     def _generate_impl_inner(self, prompt_ids, max_tokens, temperature, top_p, top_k, stop,
                              seed, on_text, presence_penalty=0.0, frequency_penalty=0.0,
-                             logprobs=None) -> GenResult:
+                             logprobs=None, check_cancel=None) -> GenResult:
         recorder = RoundRecorder(self.rounds, uuid.uuid4().hex[:8], self.mode)
         on_round = self._with_slow_round_log(recorder, len(prompt_ids))
         # Per-request facts for spec_info: TTFT (first streamed text, engine-side — the
@@ -953,6 +955,8 @@ class Engine:
 
             def on_prefill_progress(pos):
                 publish_prefill(pos, pos < len(prompt_ids))
+                if check_cancel is not None:
+                    check_cancel()
         # Depth-aware cap for DERIVED defaults: a long prompt shrinks the verify width,
         # because verify cost carries a measured width-x-depth KV-read term the flat
         # chat-depth curves can't see (cap 7 at 32k measured 1.05x vs cap 3's 1.48x;
@@ -1551,12 +1555,14 @@ _STOP = object()   # sentinel: unwedges the scheduler thread so the process can 
 
 class _Job:
     """One queued generation request awaiting a (possibly batched) run."""
-    __slots__ = ("done", "error", "on_text", "params", "prompt_ids", "result")
+    __slots__ = ("check_cancel", "done", "error", "on_text", "params", "prompt_ids",
+                 "result")
 
-    def __init__(self, prompt_ids, params, on_text):
+    def __init__(self, prompt_ids, params, on_text, check_cancel):
         self.prompt_ids = prompt_ids
         self.params = params
         self.on_text = on_text
+        self.check_cancel = check_cancel
         self.result = None
         self.error = None
         self.done = threading.Event()
@@ -1602,12 +1608,12 @@ class BatchEngine:
     # --- public API (mirrors Engine.generate) ---
     def generate(self, prompt_ids, *, max_tokens, temperature, top_p=1.0, top_k=0,
                  presence_penalty=0.0, frequency_penalty=0.0, logprobs=None, stop=None,
-                 seed=None, on_text=None) -> GenResult:
+                 seed=None, on_text=None, check_cancel=None) -> GenResult:
         job = _Job(prompt_ids,
                    {"max_tokens": max_tokens, "temperature": temperature,
                     "top_p": top_p, "top_k": top_k, "presence_penalty": presence_penalty,
                     "frequency_penalty": frequency_penalty, "logprobs": logprobs,
-                    "stop": stop or [], "seed": seed}, on_text)
+                    "stop": stop or [], "seed": seed}, on_text, check_cancel)
         self._q.put(job)
         job.done.wait()
         if job.error is not None:
@@ -1754,7 +1760,7 @@ class BatchEngine:
             job.result = self.engine._generate_impl(
                 job.prompt_ids, p["max_tokens"], p["temperature"], p["top_p"], p["top_k"],
                 p["stop"], p["seed"], job.on_text, p["presence_penalty"], p["frequency_penalty"],
-                p["logprobs"])
+                p["logprobs"], job.check_cancel)
             self.batch_stats["serial_requests"] += 1
         except BaseException as e:  # noqa: BLE001
             job.error = e
@@ -2830,6 +2836,12 @@ def make_handler(engine: Engine, api_key: str | None):
                     return self._model_operation(req.get("model"), lambda: self._race(req))
             except PoolError as error:
                 return self._send_pool_error(error)
+            except StopStreaming:
+                # ``on_text`` consumes this during decode. Reaching the handler means the
+                # client vanished while prompt chunks were still being evaluated.
+                print(f"[serve] streaming request cancelled during prefill ({route})",
+                      file=sys.stderr, flush=True)
+                return
             except (BrokenPipeError, ConnectionResetError):
                 # Client hung up mid-stream; nothing more to do — but say so. Swallowing it
                 # silently left no server-side record at all, which made a stalled client
@@ -3023,8 +3035,8 @@ def make_handler(engine: Engine, api_key: str | None):
             # periodic ping (a real Anthropic event type) keeps the client's socket and any
             # intermediary from timing out the request before the first token lands — and a
             # ping that fails to write is the disconnect signal for stretches where no text
-            # flows (a _ToolGate-buffered tool call), so generation stops at the next round
-            # instead of holding the MLX thread for a client that's gone (issue #14).
+            # flows (a _ToolGate-buffered tool call), so generation stops at the next safe
+            # prompt-chunk or decode-round boundary (issue #14).
             done = threading.Event()
             gone = threading.Event()
 
@@ -3038,9 +3050,12 @@ def make_handler(engine: Engine, api_key: str | None):
 
             threading.Thread(target=_heartbeat, daemon=True).start()
 
-            def on_text(piece: str):
+            def _alive():
                 if gone.is_set() or (is_pool and engine.is_closing):
                     raise StopStreaming()
+
+            def on_text(piece: str):
+                _alive()
                 try:
                     for name, payload in stream.delta(piece):
                         self._sse(payload, name)
@@ -3048,7 +3063,8 @@ def make_handler(engine: Engine, api_key: str | None):
                     raise StopStreaming() from e   # end cleanly, keep the prefix cache
 
             try:
-                res = engine.generate(prompt_ids, on_text=on_text, **params)
+                res = engine.generate(prompt_ids, on_text=on_text,
+                                      check_cancel=_alive, **params)
             finally:
                 done.set()
             if gone.is_set():
@@ -3155,9 +3171,12 @@ def make_handler(engine: Engine, api_key: str | None):
                 in_thinking=self._prompt_opens_thinking(prompt_ids))
             gate = A._ToolGate()
 
-            def on_text(piece: str):
+            def _alive():
                 if gone.is_set():
                     raise StopStreaming()
+
+            def on_text(piece: str):
+                _alive()
                 try:
                     for kind, text in splitter.feed(piece):
                         if kind == "reasoning" or not text:
@@ -3170,7 +3189,8 @@ def make_handler(engine: Engine, api_key: str | None):
                     raise StopStreaming() from e
 
             try:
-                res = engine.generate(prompt_ids, on_text=on_text, **params)
+                res = engine.generate(prompt_ids, on_text=on_text,
+                                      check_cancel=_alive, **params)
             finally:
                 done.set()
             if gone.is_set():
@@ -3300,8 +3320,8 @@ def make_handler(engine: Engine, api_key: str | None):
 
             # Keep-alive + liveness (see STREAM_KEEPALIVE_S). `gone` flips when a keep-alive
             # write fails — the only disconnect signal available while nothing else is on the
-            # wire — and the on_text callbacks below turn it into StopStreaming, so the loop
-            # ends at the next round with a normal partial result and the prefix cache intact.
+            # wire — and the request callbacks below turn it into StopStreaming, so work ends
+            # at the next safe prompt-chunk or decode-round boundary.
             done = threading.Event()
             gone = threading.Event()
 
@@ -3392,7 +3412,8 @@ def make_handler(engine: Engine, api_key: str | None):
                         _emit_tools_split(splitter.feed(piece))
                     except (BrokenPipeError, ConnectionResetError) as e:
                         raise StopStreaming() from e
-                res = engine.generate(prompt_ids, on_text=on_text, **params)
+                res = engine.generate(prompt_ids, on_text=on_text,
+                                      check_cancel=alive, **params)
                 if gone.is_set():
                     return res, res.finish_reason   # nobody listening; skip the emission
                 _emit_tools_split(splitter.feed("", final=True))
@@ -3426,7 +3447,8 @@ def make_handler(engine: Engine, api_key: str | None):
                         _emit_muse(muse.feed(piece))
                     except (BrokenPipeError, ConnectionResetError) as e:
                         raise StopStreaming() from e
-                res = engine.generate(prompt_ids, on_text=on_text, **params)
+                res = engine.generate(prompt_ids, on_text=on_text,
+                                      check_cancel=alive, **params)
                 _emit_muse(muse.feed("", final=True))   # flush the held-back tail
                 return res, res.finish_reason
             if chat:
@@ -3455,7 +3477,8 @@ def make_handler(engine: Engine, api_key: str | None):
                         # round so the engine can still store the prefix cache (raising
                         # anything else would invalidate it)
                         raise StopStreaming() from e
-                res = engine.generate(prompt_ids, on_text=on_text, **params)
+                res = engine.generate(prompt_ids, on_text=on_text,
+                                      check_cancel=alive, **params)
                 _emit_split(splitter.feed("", final=True))   # flush the held-back tail
                 return res, res.finish_reason
 
@@ -3465,7 +3488,8 @@ def make_handler(engine: Engine, api_key: str | None):
                     self._sse(base(piece, None))
                 except (BrokenPipeError, ConnectionResetError) as e:
                     raise StopStreaming() from e
-            res = engine.generate(prompt_ids, on_text=on_text, **params)
+            res = engine.generate(prompt_ids, on_text=on_text,
+                                  check_cancel=alive, **params)
             return res, res.finish_reason
 
     return Handler
