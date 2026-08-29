@@ -1,8 +1,8 @@
 import AppCore
 import SwiftUI
 
-/// Everything runnable, in three layers: the measured pairs the registry vouches for, whatever
-/// is already on this disk, and any Hugging Face repo the user cares to type.
+/// Everything useful for model management: models already on this disk, measured model
+/// recommendations that are not downloaded yet, and any Hugging Face repo the user types.
 ///
 /// The design keeps LM Studio's most-praised idea — answer "will this fit?" *before* someone
 /// downloads 15 GB — and adds the thing only this project has to show: the **pair**. A row
@@ -11,6 +11,7 @@ import SwiftUI
 /// model drafter-free lookup speculation.
 struct ModelsScreen: View {
     @EnvironmentObject private var model: AppModel
+    @State private var measuredPairsExpanded = true
 
     var body: some View {
         ScrollView {
@@ -51,32 +52,6 @@ struct ModelsScreen: View {
                     }
                 }
 
-                AnyModelField()
-
-                sectionTitle("Measured pairs",
-                             note: "Benchmarked drafter pairings — the speedups this project vouches for.")
-                // Not-downloaded rows stay clickable: they confirm, then download-and-load.
-                // They used to be disabled outright — which left a fresh machine with every
-                // pair greyed out and no way to download from this screen at all (issue #15).
-                ForEach(model.models) { row in
-                    // `model.model` is the SELECTED target, set before a load succeeds — on
-                    // its own it left a "loaded" badge on a model whose load failed (PR #18).
-                    ModelRowView(row: row,
-                                 isLoaded: model.poolStatus(for: row.target)?.ready
-                                     ?? (model.isServerReady && row.target == model.model),
-                                 canLoad: model.poolStatus(for: row.target)?.ready != true
-                                     && !model.isModelLoading,
-                                 canUnload: !model.isModelLoading) {
-                        Task { await model.switchModel(to: row.target) }
-                    } onUnload: {
-                        Task { await model.unloadModel(row.target) }
-                    }
-                }
-                if model.models.isEmpty {
-                    ContentUnavailableView("No models listed", systemImage: "shippingbox")
-                        .frame(height: 160)
-                }
-
                 let onDisk = model.installedModels.filter { !$0.isDrafter }
                 if !onDisk.isEmpty {
                     sectionTitle("On this Mac",
@@ -88,6 +63,10 @@ struct ModelsScreen: View {
                                              ?? (model.isServerReady && installed.repo == model.model))
                     }
                 }
+
+                sectionTitle("Load any model",
+                             note: "Load any MLX-compatible model directly from Hugging Face.")
+                AnyModelField()
 
                 let drafters = model.installedModels.filter(\.isDrafter)
                 if !drafters.isEmpty {
@@ -108,6 +87,29 @@ struct ModelsScreen: View {
                             .font(.caption).foregroundStyle(.secondary)
                     }
                     .padding(.top, 2)
+                }
+
+                let measuredModelsNotOnDisk = model.models.filter { !$0.targetInstalled }
+                if !measuredModelsNotOnDisk.isEmpty {
+                    DisclosureGroup(isExpanded: $measuredPairsExpanded) {
+                        // These are real target models, not standalone drafter entries. They
+                        // confirm first, then download only; loading happens from On this Mac.
+                        ForEach(measuredModelsNotOnDisk) { row in
+                            ModelRowView(row: row,
+                                         isLoaded: model.poolStatus(for: row.target)?.ready
+                                             ?? (model.isServerReady && row.target == model.model),
+                                         canLoad: model.poolStatus(for: row.target)?.ready != true
+                                             && !model.isModelLoading && !model.isModelDownloading,
+                                         canUnload: !model.isModelLoading && !model.isModelDownloading) {
+                                Task { await model.downloadModel(row.target) }
+                            } onUnload: {
+                                Task { await model.unloadModel(row.target) }
+                            }
+                        }
+                    } label: {
+                        sectionTitle("Measured pairs",
+                                     note: "Real models with a benchmarked drafter pair — not downloaded yet.")
+                    }
                 }
             }
             .padding(16)
@@ -178,10 +180,10 @@ private struct PoolStatusRow: View {
                     HStack(spacing: 6) {
                         Button("Unload", action: unload)
                             .buttonStyle(.bordered).controlSize(.small)
-                            .disabled(model.isModelLoading)
+                            .disabled(model.isModelLoading || model.isModelDownloading)
                         Button(status.pinned ? "Unpin" : "Keep in memory", action: togglePin)
                             .buttonStyle(.bordered).controlSize(.small)
-                            .disabled(model.isModelLoading)
+                            .disabled(model.isModelLoading || model.isModelDownloading)
                     }
                 }
             }
@@ -216,7 +218,7 @@ struct AnyModelField: View {
                     .buttonStyle(.borderedProminent)
                     .disabled(trimmed.isEmpty
                               || (trimmed == model.model && model.isSelectedModelResident)
-                              || model.isModelLoading)
+                              || model.isModelLoading || model.isModelDownloading)
             }
             Text("Downloads on first load. A known target gets its drafter pair; anything "
                  + "else runs with drafter-free lookup speculation.")
@@ -298,7 +300,7 @@ struct ModelRowView: View {
                     .controlSize(.small)
                     .disabled(!canUnload)
             } else if canLoad {
-                Button(row.ready ? "Load" : "Download & load", action: load)
+                Button(row.ready ? "Load" : "Download", action: load)
                     .buttonStyle(.borderedProminent)
                     .controlSize(.small)
             }
@@ -312,11 +314,11 @@ struct ModelRowView: View {
             "Download \(row.shortTarget)\(row.ram.map { " (\($0))" } ?? "")?",
             isPresented: $confirmingDownload, titleVisibility: .visible
         ) {
-            Button("Download and load") { onLoad() }
+            Button("Download") { onLoad() }
         } message: {
             Text(row.fits == false
                  ? "This model looks too large for this Mac — it may not run once downloaded."
-                 : "Downloads the missing pieces, then loads the pair. You can cancel mid-download.")
+                 : "Downloads the missing model files. You can load it afterwards from On this Mac.")
         }
     }
 
@@ -429,7 +431,7 @@ struct InstalledRowView: View {
                     if installed.registryID != nil {
                         HStack(spacing: 3) {
                             Image(systemName: "arrow.triangle.merge").imageScale(.small)
-                            Text("drafter pair available")
+                            Text("measured pair available")
                         }
                         .font(.caption)
                         .foregroundStyle(Theme.spark)
@@ -445,11 +447,11 @@ struct InstalledRowView: View {
             if !isLoaded {
                 Button("Load") { Task { await model.switchModel(to: installed.repo) } }
                     .controlSize(.small)
-                    .disabled(model.isModelLoading)
+                    .disabled(model.isModelLoading || model.isModelDownloading)
             } else {
                 Button("Unload") { Task { await model.unloadModel(installed.repo) } }
                     .controlSize(.small)
-                    .disabled(model.isModelLoading)
+                    .disabled(model.isModelLoading || model.isModelDownloading)
             }
             RevealButton(path: installed.path)
             // LM Studio's downloads and the user's own model folders are not our files —

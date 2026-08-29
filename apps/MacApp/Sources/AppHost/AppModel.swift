@@ -238,6 +238,9 @@ final class AppModel: ObservableObject {
     /// A model load/swap in flight (`/admin/load`). The window stays up; screens show
     /// progress inline and generation controls stay disabled via `isServerReady`.
     @Published var isModelLoading = false
+    /// A cache-only model download in flight (`/admin/download`). It does not change the
+    /// resident model or consume model memory.
+    @Published var isModelDownloading = false
     /// Live weight-download progress while a first-time load fetches from the hub
     /// (`/health.download`, polled during the load). Nil for cached models and old engines.
     @Published var downloadProgress: DownloadProgress?
@@ -248,6 +251,8 @@ final class AppModel: ObservableObject {
     /// A cancel has been requested and the load is unwinding — disables the cancel buttons
     /// so a slow unwind can't collect duplicate requests.
     @Published var isCancellingLoad = false
+    /// Completion notice shown in the global status bar.
+    @Published var downloadNotice: String?
     /// One-time banner after onboarding: land in the Lab with the race ready to run.
     @Published var showLabWelcome = false
 
@@ -454,7 +459,7 @@ final class AppModel: ObservableObject {
     /// fixed port (Settings → Local server) or model folder takes effect without relaunching
     /// the app. The model reloads through the same path a launch uses.
     func restartEngine() async {
-        guard !isModelLoading else { return }
+        guard !isModelLoading, !isModelDownloading else { return }
         let activeSettings = Defaults.modelSettings(for: model)
             ?? selectedHealth.map(ModelSettings.init)
         logStore.note("restarting engine")
@@ -696,6 +701,44 @@ final class AppModel: ObservableObject {
         }
     }
 
+    /// Download a target and its resolved drafter into the cache without loading either.
+    func downloadModel(_ target: String) async {
+        guard let client = apiClient, !isModelLoading, !isModelDownloading else { return }
+        let target = target.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !target.isEmpty else { return }
+
+        isModelDownloading = true
+        downloadProgress = nil
+        downloadNotice = nil
+        modelSwitchError = nil
+        logStore.note("downloading model → (target)")
+        let poll = Task { [weak self] in
+            while !Task.isCancelled {
+                let health = try? await client.health()
+                await MainActor.run {
+                    self?.downloadProgress = health?.download
+                }
+                try? await Task.sleep(nanoseconds: 1_000_000_000)
+            }
+        }
+        defer {
+            poll.cancel()
+            isModelDownloading = false
+            downloadProgress = nil
+        }
+        do {
+            try await client.downloadModel(target)
+            currentHealth = try? await client.health()
+            await refreshDiagnostics()
+            let name = target.components(separatedBy: "/").last ?? target
+            downloadNotice = "\(name) downloaded — ready to load."
+            logStore.note("download complete → \(target)")
+        } catch {
+            modelSwitchError = error.localizedDescription
+            logStore.note("model download failed: \(error.localizedDescription)")
+        }
+    }
+
     /// Cancel the in-flight first-time download (`/admin/load/cancel`). The blocked
     /// `/admin/load` then unwinds cleanly and — via `switchModel`'s restore path — the
     /// previously loaded model comes back if there was one. `removePartial` also deletes
@@ -725,7 +768,8 @@ final class AppModel: ObservableObject {
         let target = target.trimmingCharacters(in: .whitespacesAndNewlines)
         // Re-picking the loaded model is a no-op — but the *same name in the no-model state*
         // (a failed load, an unload) is a legitimate retry, so only bounce when it's serving.
-        guard !target.isEmpty, !(target == model && isSelectedModelResident), apiClient != nil
+        guard !target.isEmpty, !(target == model && isSelectedModelResident), apiClient != nil,
+              !isModelDownloading
         else { return }
         let previous = model
         let hadModel = isSelectedModelResident
@@ -757,7 +801,7 @@ final class AppModel: ObservableObject {
     /// Release a resident model without loading another — frees its memory; the server, the
     /// port, and connected clients' base URLs all survive. `/admin/load` brings one back.
     func unloadModel(_ target: String? = nil) async {
-        guard let client = apiClient, !isModelLoading else { return }
+        guard let client = apiClient, !isModelLoading, !isModelDownloading else { return }
         let target = target ?? model
         let usesPool = currentHealth?.pool != nil
         let isResident = usesPool

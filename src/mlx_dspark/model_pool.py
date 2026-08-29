@@ -169,6 +169,15 @@ class ModelPool:
             return any(slot.leases > 0 or slot.state in ("loading", "restoring")
                        for slot in self._slots.values())
 
+    def telemetry_log(self, model: str | None = None):
+        """Return a resident model's round log without holding a request lease."""
+        canonical = self._canonical_model(model, require_local=False)
+        with self._lock:
+            slot = self._slots.get(canonical)
+            if slot is None or slot.state != "ready" or slot.engine is None:
+                raise PoolError("model_not_loaded", "model is not loaded", status=503)
+            return slot.engine.rounds
+
     @property
     def is_closing(self) -> bool:
         with self._lock:

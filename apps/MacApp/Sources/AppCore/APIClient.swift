@@ -432,6 +432,15 @@ public struct APIClient: Sendable {
         return try JSONDecoder().decode(LoadStatus.self, from: data)
     }
 
+    /// Download a target and its resolved drafter without loading either into memory.
+    public func downloadModel(_ target: String) async throws {
+        let body = try JSONSerialization.data(withJSONObject: ["model": target])
+        var req = request("admin/download", method: "POST", body: body)
+        req.timeoutInterval = 1800
+        let (data, response) = try await session.data(for: req)
+        try Self.check(response, data)
+    }
+
     /// Register the app's persistent settings as a session-only JIT load profile. This never
     /// loads weights: absent context/mode extras keep the server's safe defaults instead of
     /// leaking another resident model's options into this one.

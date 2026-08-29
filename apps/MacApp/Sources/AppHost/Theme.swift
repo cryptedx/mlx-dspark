@@ -23,6 +23,10 @@ enum Theme {
     static let cardFill = AnyShapeStyle(.quaternary.opacity(0.25))
     /// Hairline that separates a card from the window without shouting.
     static let cardStroke = AnyShapeStyle(.separator.opacity(0.55))
+    /// Shared geometry: the chrome follows the same outer radius as cards, with a tighter
+    /// radius for controls nested inside them.
+    static let cardRadius: CGFloat = 10
+    static let controlRadius: CGFloat = 8
 
     /// Color for a round's draft source (`RoundEvent.source`).
     static func source(_ source: String) -> Color {
