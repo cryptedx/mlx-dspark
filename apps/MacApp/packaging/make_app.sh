@@ -88,10 +88,23 @@ else
 fi
 
 # --- sign --------------------------------------------------------------------------------
+# A plain ad-hoc signature's designated requirement is its cdhash, so macOS treats every debug
+# rebuild as a new app and asks for protected-folder access again. Keep the debug requirement
+# stable by identifier; release builds retain the stricter default ad-hoc requirement.
+if [[ "$CONFIG" == "debug" ]]; then
+    echo "==> Signing (ad-hoc, stable debug identity)"
+    UV_SIGN_ARGS=(--force --identifier "${BUNDLE_ID}.uv" -s -
+                  -r "=designated => identifier \"${BUNDLE_ID}.uv\"")
+    APP_SIGN_ARGS=(--force --deep -s -
+                   -r "=designated => identifier \"${BUNDLE_ID}\"")
+else
+    echo "==> Signing (ad-hoc)"
+    UV_SIGN_ARGS=(--force -s -)
+    APP_SIGN_ARGS=(--force --deep -s -)
+fi
 # Nested code first, then the bundle: signing outer-first invalidates the outer signature.
-echo "==> Signing (ad-hoc)"
-[[ -f "$APP/Contents/Resources/bin/uv" ]] && codesign --force -s - "$APP/Contents/Resources/bin/uv"
-codesign --force --deep -s - "$APP"
+[[ -f "$APP/Contents/Resources/bin/uv" ]] && codesign "${UV_SIGN_ARGS[@]}" "$APP/Contents/Resources/bin/uv"
+codesign "${APP_SIGN_ARGS[@]}" "$APP"
 
 echo
 echo "Built $APP"
