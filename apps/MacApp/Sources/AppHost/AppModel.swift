@@ -758,7 +758,9 @@ final class AppModel: ObservableObject {
             isCancellingLoad = false
         }
         do {
-            try await client.downloadModel(target)
+            let fallbackPython = engineURL?.deletingLastPathComponent()
+                .appendingPathComponent("python")
+            try await client.downloadModel(target, fallbackPython: fallbackPython)
             currentHealth = try? await client.health()
             await refreshDiagnostics()
             let name = target.components(separatedBy: "/").last ?? target

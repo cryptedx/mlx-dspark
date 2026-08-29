@@ -772,6 +772,21 @@ def test_admin_download_does_not_load_model(holder_server, monkeypatch):
     assert holder.current is not None
 
 
+def test_admin_download_accepts_huggingface_model_url(holder_server, monkeypatch):
+    _holder, base = holder_server
+    downloaded = []
+    monkeypatch.setattr("mlx_dspark.download.ensure_local",
+                        lambda model: downloaded.append(model))
+
+    result = _post(base, "/admin/download", {
+        "model": "https://huggingface.co/Jiunsong/SuperQwen3.8-27b-abliterated-MLX-4bit",
+    })
+
+    assert result["downloaded"] is True
+    assert downloaded == ["Jiunsong/SuperQwen3.8-27b-abliterated-MLX-4bit"]
+    assert holder.current is not None
+
+
 # --- streaming reasoning split (OpenAI chat SSE) -----------------------------------------
 
 

@@ -438,14 +438,45 @@ public struct APIClient: Sendable {
         return try JSONDecoder().decode(LoadStatus.self, from: data)
     }
 
-    /// Download a target and its resolved drafter into the cache without loading either into memory (`/admin/download`).
-    public func downloadModel(_ target: String) async throws {
+    /// Download a target and its resolved drafter into the cache without loading either into
+    /// memory (`/admin/download`). Older released engines predate that route, so use their
+    /// app-owned Python runtime as a cache-only fallback instead of loading a 15 GB model just
+    /// to download it.
+    public func downloadModel(_ target: String, fallbackPython: URL? = nil) async throws {
         let body = try JSONSerialization.data(withJSONObject: ["model": target])
         var req = request("admin/download", method: "POST", body: body)
         req.timeoutInterval = 1800
-        let (data, response) = try await session.data(for: req)
-        try Self.check(response, data)
+        do {
+            let (data, response) = try await session.data(for: req)
+            try Self.check(response, data)
+        } catch APIError.badStatus(404, let message)
+                where message.localizedCaseInsensitiveContains("unknown route /admin/download") {
+            guard let fallbackPython else { throw APIError.badStatus(404, message) }
+            try await Shell.check(fallbackPython, ["-c", Self.hubDownloadCode, target])
+        }
     }
+
+    private static let hubDownloadCode = """
+    import os
+    import sys
+    from urllib.parse import urlsplit
+    from huggingface_hub import snapshot_download
+    from mlx_dspark.load import resolve_mode
+
+    ref = sys.argv[1].strip()
+    if ref.startswith("gguf:") or os.path.isdir(os.path.expanduser(ref)):
+        raise SystemExit(0)
+    parsed = urlsplit(ref)
+    if parsed.scheme in ("http", "https") and parsed.netloc.lower() in {"huggingface.co", "www.huggingface.co"}:
+        parts = [part for part in parsed.path.split("/") if part]
+        if len(parts) != 2:
+            raise ValueError("Hugging Face model URLs must point to https://huggingface.co/org/model")
+        ref = "/".join(parts)
+    _, target_repo, drafter_repo = resolve_mode(ref)
+    for repo in (target_repo, drafter_repo):
+        if repo:
+            snapshot_download(repo)
+    """
 
     /// Register the app's persistent settings as a session-only JIT load profile. This never
     /// loads weights: absent context/mode extras keep the server's safe defaults instead of

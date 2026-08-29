@@ -13,6 +13,18 @@ def test_full_repo_auto_resolves_drafter():
     assert resolve("mlx-community/Qwen3-8B-8bit", mode="dflash")[1] == "z-lab/Qwen3-8B-DFlash-b16"
 
 
+def test_huggingface_model_url_normalizes_to_repo_id():
+    assert resolve("https://huggingface.co/Jiunsong/SuperQwen3.8-27b-abliterated-MLX-4bit",
+                   mode="lookup") == (
+        "Jiunsong/SuperQwen3.8-27b-abliterated-MLX-4bit", None)
+
+
+def test_huggingface_model_url_rejects_non_model_pages():
+    with pytest.raises(ValueError, match="must point to"):
+        resolve("https://huggingface.co/Jiunsong/SuperQwen3.8-27b-abliterated-MLX-4bit/tree/main",
+                mode="lookup")
+
+
 def test_quantization_agnostic():
     # the drafter matches the model, not the quant
     for repo in ("mlx-community/Qwen3-8B-4bit", "some-org/Qwen3-8B-bf16", "x/Qwen3-8B-8bit"):

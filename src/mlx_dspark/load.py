@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import glob
 import os
+from urllib.parse import urlsplit
 
 import mlx.core as mx
 import mlx.nn as nn
@@ -27,6 +28,22 @@ PRESETS = {
 }
 DEFAULT_TARGET = PRESETS["gemma4"]["target"]
 DEFAULT_DRAFTER = PRESETS["gemma4"]["drafter"]
+
+
+def normalize_model_ref(value: str | None) -> str | None:
+    """Accept a Hugging Face model page wherever a repo id is expected."""
+    if value is None:
+        return None
+    value = value.strip()
+    parsed = urlsplit(value)
+    if parsed.scheme in ("http", "https") and parsed.netloc.lower() in {
+        "huggingface.co", "www.huggingface.co",
+    }:
+        parts = [part for part in parsed.path.split("/") if part]
+        if len(parts) != 2:
+            raise ValueError("Hugging Face model URLs must point to https://huggingface.co/org/model")
+        return "/".join(parts)
+    return value
 
 # z-lab's original DFlash drafters (block-diffusion; reuse the target's embed/lm_head).
 # Same matched-instruct targets as DSpark so the two can be benchmarked head-to-head.
@@ -299,7 +316,8 @@ def resolve(model: str | None = None, *, mode: str = "dspark", drafter: str | No
     treated as the legacy family alias. ``mode="baseline"`` / ``"lookup"`` need no drafter and
     return ``(target, None)`` — so those modes work with ANY target, registered or not.
     """
-    tgt = model or target or family
+    tgt = normalize_model_ref(model or target or family)
+    drafter = normalize_model_ref(drafter)
     if tgt in _FAMILY_ALIASES:                     # legacy "qwen3"/"gemma4"
         tgt = _FAMILY_ALIASES[tgt]
     if not tgt:
