@@ -209,6 +209,7 @@ struct ModelPill: View {
                             Text(row.shortTarget)
                         }
                     }
+                    .disabled(model.isModelLoading)
                 }
             }
             let measuredTargets = Set(model.models.filter(\.ready).map(\.target))
@@ -227,14 +228,18 @@ struct ModelPill: View {
                                 Text(installed.shortRepo)
                             }
                         }
+                        .disabled(model.isModelLoading)
                     }
                 }
             }
             Divider()
             if model.isServerReady {
-                Button("Unload selected model") { Task { await model.unloadModel() } }
+                Button("Unload \(model.activeModelName ?? "selected model")") {
+                    Task { await model.unloadModel() }
+                }
+                .disabled(model.isModelLoading)
             }
-            Button("All models…") { model.screen = .models }
+            Button("Manage models…") { model.screen = .models }
         } label: {
             HStack(spacing: 6) {
                 if model.isModelLoading {

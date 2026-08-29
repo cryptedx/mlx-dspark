@@ -754,16 +754,32 @@ final class AppModel: ObservableObject {
         modelSwitchError = failure
     }
 
-    /// Release the loaded model without loading another — frees its memory; the server, the
+    /// Release a resident model without loading another — frees its memory; the server, the
     /// port, and connected clients' base URLs all survive. `/admin/load` brings one back.
-    func unloadModel() async {
-        guard let client = apiClient, isSelectedModelResident else { return }
-        generationTask?.cancel()
-        resetModelRuntimeState()
-        logStore.note("unloading model")
-        _ = try? await client.unloadModel(model: model)
-        currentHealth = try? await client.health()
-        await refreshDiagnostics()
+    func unloadModel(_ target: String? = nil) async {
+        guard let client = apiClient, !isModelLoading else { return }
+        let target = target ?? model
+        let usesPool = currentHealth?.pool != nil
+        let isResident = usesPool
+            ? poolStatus(for: target)?.ready == true
+            : target == model && isSelectedModelResident
+        guard isResident else { return }
+
+        let unloadingSelected = target == model
+        if unloadingSelected {
+            generationTask?.cancel()
+        }
+        modelSwitchError = nil
+        logStore.note("unloading model → \(target)")
+        do {
+            _ = try await client.unloadModel(model: target)
+            if unloadingSelected { resetModelRuntimeState() }
+            currentHealth = try? await client.health()
+            if unloadingSelected { await refreshDiagnostics() }
+        } catch {
+            currentHealth = try? await client.health()
+            modelSwitchError = error.localizedDescription
+        }
     }
 
     func setKeepLoaded(_ target: String, _ keepLoaded: Bool) async {

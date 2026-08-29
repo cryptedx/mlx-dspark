@@ -40,11 +40,13 @@ struct ModelsScreen: View {
                 header
 
                 if !model.poolModelStatuses.isEmpty {
-                    sectionTitle("Model pool", note: "Resident models share one MLX runtime. "
-                                 + "Pins keep weights resident; caches may still be reclaimed.")
+                    sectionTitle("Loaded now", note: "These models use memory right now. "
+                                 + "Unload one to free it; keep one in memory to prevent idle eviction.")
                     ForEach(model.poolModelStatuses) { status in
                         PoolStatusRow(status: status) {
                             Task { await model.setKeepLoaded(status.model, !status.pinned) }
+                        } unload: {
+                            Task { await model.unloadModel(status.model) }
                         }
                     }
                 }
@@ -63,8 +65,11 @@ struct ModelsScreen: View {
                                  isLoaded: model.poolStatus(for: row.target)?.ready
                                      ?? (model.isServerReady && row.target == model.model),
                                  canLoad: model.poolStatus(for: row.target)?.ready != true
-                                     && !model.isModelLoading) {
+                                     && !model.isModelLoading,
+                                 canUnload: !model.isModelLoading) {
                         Task { await model.switchModel(to: row.target) }
+                    } onUnload: {
+                        Task { await model.unloadModel(row.target) }
                     }
                 }
                 if model.models.isEmpty {
@@ -122,8 +127,8 @@ struct ModelsScreen: View {
             }
             .font(.caption).foregroundStyle(.secondary)
 
-            Text("Models load on demand over one stable port. You can keep up to two primary "
-                 + "models resident for chat and compression.")
+            Text("Load brings a model into memory. Unload frees it again; Keep in memory "
+                 + "prevents automatic idle eviction.")
                 .font(.caption).foregroundStyle(.secondary)
 
             // The badges are M4 Pro measurements. Say how this Mac compares instead of
@@ -148,8 +153,10 @@ struct ModelsScreen: View {
 }
 
 private struct PoolStatusRow: View {
+    @EnvironmentObject private var model: AppModel
     let status: PoolModelStatus
     let togglePin: () -> Void
+    let unload: () -> Void
 
     private var shortName: String {
         status.model.components(separatedBy: "/").last ?? status.model
@@ -168,8 +175,14 @@ private struct PoolStatusRow: View {
                 }
                 Spacer()
                 if status.ready {
-                    Button(status.pinned ? "Unpin" : "Keep loaded", action: togglePin)
-                        .buttonStyle(.bordered).controlSize(.small)
+                    HStack(spacing: 6) {
+                        Button("Unload", action: unload)
+                            .buttonStyle(.bordered).controlSize(.small)
+                            .disabled(model.isModelLoading)
+                        Button(status.pinned ? "Unpin" : "Keep in memory", action: togglePin)
+                            .buttonStyle(.bordered).controlSize(.small)
+                            .disabled(model.isModelLoading)
+                    }
                 }
             }
             if let reason = status.evictionReason {
@@ -202,7 +215,8 @@ struct AnyModelField: View {
                 Button("Load") { load() }
                     .buttonStyle(.borderedProminent)
                     .disabled(trimmed.isEmpty
-                              || (trimmed == model.model && model.isSelectedModelResident))
+                              || (trimmed == model.model && model.isSelectedModelResident)
+                              || model.isModelLoading)
             }
             Text("Downloads on first load. A known target gets its drafter pair; anything "
                  + "else runs with drafter-free lookup speculation.")
@@ -255,20 +269,45 @@ struct ModelRowView: View {
     let row: ModelRow
     let isLoaded: Bool
     var canLoad: Bool = false
+    var canUnload: Bool = true
     var onLoad: () -> Void = {}
+    var onUnload: () -> Void = {}
     @State private var confirmingDownload = false
 
     var body: some View {
-        Button {
-            // A ready pair loads immediately; a missing one confirms first — the size is
-            // right on the row, and a mis-click must not start a multi-gigabyte fetch
-            // (the accident behind issue #15; cancel exists now, but asking is cheaper).
-            if row.ready { onLoad() } else { confirmingDownload = true }
-        } label: {
-            content
+        HStack(alignment: .top, spacing: 14) {
+            Button(action: load) {
+                details
+                    .frame(maxWidth: .infinity, alignment: .leading)
+                    .contentShape(Rectangle())
+            }
+            .buttonStyle(.plain)
+            .disabled(!canLoad)
+
+            Spacer(minLength: 4)
+            if let speedup = row.speedup {
+                Text(speedup)
+                    .font(.system(.callout, design: .rounded).monospacedDigit())
+                    .fontWeight(.semibold)
+                    .foregroundStyle(Theme.spark)
+                    .help("Measured on an M4 Pro; yours will differ")
+            }
+            if isLoaded {
+                Button("Unload", action: onUnload)
+                    .buttonStyle(.bordered)
+                    .controlSize(.small)
+                    .disabled(!canUnload)
+            } else if canLoad {
+                Button(row.ready ? "Load" : "Download & load", action: load)
+                    .buttonStyle(.borderedProminent)
+                    .controlSize(.small)
+            }
         }
-        .buttonStyle(.plain)
-        .disabled(!canLoad)
+        .padding(14)
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .background(Theme.cardFill, in: RoundedRectangle(cornerRadius: 10))
+        .overlay(RoundedRectangle(cornerRadius: 10).strokeBorder(
+            isLoaded ? AnyShapeStyle(Theme.spark.opacity(0.45)) : Theme.cardStroke, lineWidth: 1))
         .confirmationDialog(
             "Download \(row.shortTarget)\(row.ram.map { " (\($0))" } ?? "")?",
             isPresented: $confirmingDownload, titleVisibility: .visible
@@ -281,60 +320,47 @@ struct ModelRowView: View {
         }
     }
 
-    private var content: some View {
-        HStack(alignment: .top, spacing: 14) {
-            VStack(alignment: .leading, spacing: 5) {
-                HStack(spacing: 8) {
-                    Text(row.shortTarget).font(.headline)
-                    if isLoaded { LoadedBadge() }
-                }
-
-                // The pairing — this app's domain language.
-                if let drafter = row.shortDrafter {
-                    HStack(spacing: 5) {
-                        Image(systemName: "arrow.triangle.merge").imageScale(.small)
-                        Text(drafter).font(.caption.monospaced())
-                    }
-                    .foregroundStyle(.secondary)
-                }
-
-                HStack(spacing: 10) {
-                    badge(fitsLabel, systemImage: fitsSymbol, tint: fitsTint)
-                    badge(stateLabel, systemImage: stateSymbol,
-                          tint: row.ready ? Theme.verified : .secondary)
-                    if let ram = row.ram {
-                        Text(ram).font(.caption).foregroundStyle(.secondary)
-                    }
-                    // Physics, not a promise: bandwidth ÷ weight bytes is the most a plain
-                    // decode of these weights can do on this Mac. Speculation multiplies it.
-                    if let ceiling = row.ceilingTps {
-                        Text(String(format: "~%.0f tok/s plain ceiling here", ceiling))
-                            .font(.caption).foregroundStyle(.secondary)
-                            .help("This Mac's memory bandwidth divided by the model's weight "
-                                  + "bytes — the single-stream roofline. Speculative decoding "
-                                  + "is what beats it.")
-                    }
-                }
+    private var details: some View {
+        VStack(alignment: .leading, spacing: 5) {
+            HStack(spacing: 8) {
+                Text(row.shortTarget).font(.headline)
+                if isLoaded { LoadedBadge() }
             }
-            Spacer()
-            if let speedup = row.speedup {
-                Text(speedup)
-                    .font(.system(.callout, design: .rounded).monospacedDigit())
-                    .fontWeight(.semibold)
-                    .foregroundStyle(Theme.spark)
-                    .help("Measured on an M4 Pro; yours will differ")
+
+            // The pairing — this app's domain language.
+            if let drafter = row.shortDrafter {
+                HStack(spacing: 5) {
+                    Image(systemName: "arrow.triangle.merge").imageScale(.small)
+                    Text(drafter).font(.caption.monospaced())
+                }
+                .foregroundStyle(.secondary)
             }
-            if canLoad {
-                Image(systemName: row.ready ? "arrow.right.circle" : "arrow.down.circle")
-                    .foregroundStyle(.tint)
-                    .help(row.ready ? "Load this model" : "Download and load this pair")
+
+            HStack(spacing: 10) {
+                badge(fitsLabel, systemImage: fitsSymbol, tint: fitsTint)
+                badge(stateLabel, systemImage: stateSymbol,
+                      tint: row.ready ? Theme.verified : .secondary)
+                if let ram = row.ram {
+                    Text(ram).font(.caption).foregroundStyle(.secondary)
+                }
+                // Physics, not a promise: bandwidth ÷ weight bytes is the most a plain
+                // decode of these weights can do on this Mac. Speculation multiplies it.
+                if let ceiling = row.ceilingTps {
+                    Text(String(format: "~%.0f tok/s plain ceiling here", ceiling))
+                        .font(.caption).foregroundStyle(.secondary)
+                        .help("This Mac's memory bandwidth divided by the model's weight "
+                              + "bytes — the single-stream roofline. Speculative decoding "
+                              + "is what beats it.")
+                }
             }
         }
-        .padding(14)
         .frame(maxWidth: .infinity, alignment: .leading)
-        .background(Theme.cardFill, in: RoundedRectangle(cornerRadius: 10))
-        .overlay(RoundedRectangle(cornerRadius: 10).strokeBorder(
-            isLoaded ? AnyShapeStyle(Theme.spark.opacity(0.45)) : Theme.cardStroke, lineWidth: 1))
+    }
+
+    private func load() {
+        // A ready pair loads immediately; a missing one confirms first — a mis-click must not
+        // start a multi-gigabyte fetch.
+        if row.ready { onLoad() } else { confirmingDownload = true }
     }
 
     private var fitsLabel: String {
@@ -419,6 +445,11 @@ struct InstalledRowView: View {
             if !isLoaded {
                 Button("Load") { Task { await model.switchModel(to: installed.repo) } }
                     .controlSize(.small)
+                    .disabled(model.isModelLoading)
+            } else {
+                Button("Unload") { Task { await model.unloadModel(installed.repo) } }
+                    .controlSize(.small)
+                    .disabled(model.isModelLoading)
             }
             RevealButton(path: installed.path)
             // LM Studio's downloads and the user's own model folders are not our files —
