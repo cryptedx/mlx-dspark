@@ -759,6 +759,19 @@ def test_inventory_routes_answer_without_a_model(holder_server):
     assert "models" in inv and "installed" in inv
 
 
+def test_admin_download_does_not_load_model(holder_server, monkeypatch):
+    holder, base = holder_server
+    downloaded = []
+    monkeypatch.setattr("mlx_dspark.download.ensure_local",
+                        lambda model: downloaded.append(model))
+
+    result = _post(base, "/admin/download", {"model": "org/model"})
+
+    assert result == {"model": "org/model", "downloaded": True}
+    assert downloaded == ["org/model"]
+    assert holder.current is not None
+
+
 # --- streaming reasoning split (OpenAI chat SSE) -----------------------------------------
 
 

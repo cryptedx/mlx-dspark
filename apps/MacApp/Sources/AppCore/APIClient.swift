@@ -6,8 +6,8 @@ import Foundation
 // to every response — that non-standard block is where the whole point of this project lives
 // (accept length, cap, lookup rounds), so it is a first-class type here, not an afterthought.
 
-/// One primary model in the on-demand resident pool. Pins and residency are session-only; the
-/// Mac app remains the durable source for each model's loading profile.
+/// One primary model in the on-demand resident pool. Residency is session-only; the Mac app
+/// keeps the per-model pin preference with the rest of that model's loading profile.
 public struct PoolModelStatus: Decodable, Sendable, Equatable, Identifiable {
     public var id: String { model }
     public let model: String
@@ -25,6 +25,7 @@ public struct PoolModelStatus: Decodable, Sendable, Equatable, Identifiable {
     public let drafter: String?
     public let maxDraft: String?
     public let contextWindow: Int?
+    public let contextTokens: Int?
     public let maxOutputTokens: Int?
     public let supportsReasoningEffort: Bool?
     public let confidenceThreshold: Double?
@@ -41,6 +42,7 @@ public struct PoolModelStatus: Decodable, Sendable, Equatable, Identifiable {
         case evictionReason = "eviction_reason"
         case maxDraft = "max_draft"
         case contextWindow = "context_window"
+        case contextTokens = "context_tokens"
         case maxOutputTokens = "max_output_tokens"
         case supportsReasoningEffort = "supports_reasoning_effort"
         case confidenceThreshold = "confidence_threshold"
@@ -91,6 +93,8 @@ public struct HealthInfo: Decodable, Sendable, Equatable {
     /// Configured draft cap — `"auto"` or the pinned/derived value as a string.
     public let maxDraft: String?
     public let contextWindow: Int?
+    /// Tokens used by the most recent request; optional for older engines.
+    public let contextTokens: Int?
     public let maxOutputTokens: Int?
     /// Whether the loaded model's chat template reads `reasoning_effort` (Qwen3.8-class).
     /// Optional so the app keeps decoding health from older engines that don't report it.
@@ -142,6 +146,7 @@ public struct HealthInfo: Decodable, Sendable, Equatable {
         case thinkingDefault = "thinking_default"
         case maxDraft = "max_draft"
         case contextWindow = "context_window"
+        case contextTokens = "context_tokens"
         case maxOutputTokens = "max_output_tokens"
         case supportsReasoningEffort = "supports_reasoning_effort"
         case confidenceThreshold = "confidence_threshold"
@@ -166,6 +171,7 @@ public extension HealthInfo {
         drafter = poolStatus.drafter
         maxDraft = poolStatus.maxDraft
         contextWindow = poolStatus.contextWindow
+        contextTokens = poolStatus.contextTokens
         maxOutputTokens = poolStatus.maxOutputTokens
         supportsReasoningEffort = poolStatus.supportsReasoningEffort
         confidenceThreshold = poolStatus.confidenceThreshold
@@ -432,13 +438,23 @@ public struct APIClient: Sendable {
         return try JSONDecoder().decode(LoadStatus.self, from: data)
     }
 
+    /// Download a model into the engine cache without loading it (`/admin/download`).
+    public func downloadModel(_ target: String) async throws {
+        let body = try JSONSerialization.data(withJSONObject: ["model": target])
+        var req = request("admin/download", method: "POST", body: body)
+        req.timeoutInterval = 1800
+        let (data, response) = try await session.data(for: req)
+        try Self.check(response, data)
+    }
+
     /// Register the app's persistent settings as a session-only JIT load profile. This never
     /// loads weights: absent context/mode extras keep the server's safe defaults instead of
     /// leaking another resident model's options into this one.
     public func registerModelProfile(_ target: String, mode: String,
                                      maxDraft: String, confidence: Double,
                                      contextWindow: Int?, lookupDrafts: Bool?, kvBits: Int?,
-                                     cpuPrefill: Bool?, enableThinking: Bool?) async throws {
+                                     cpuPrefill: Bool?, enableThinking: Bool?,
+                                     keepLoaded: Bool? = nil) async throws {
         var profile: [String: Any] = ["mode": mode, "max_draft": Int(maxDraft) ?? maxDraft,
                                       "confidence_threshold": confidence]
         if let contextWindow { profile["context_window"] = contextWindow }
@@ -446,6 +462,7 @@ public struct APIClient: Sendable {
         if let kvBits { profile["kv_bits"] = kvBits }
         if let cpuPrefill { profile["cpu_split"] = cpuPrefill ? "auto" : 0 }
         if let enableThinking { profile["enable_thinking"] = enableThinking }
+        if let keepLoaded { profile["keep_loaded"] = keepLoaded }
         let payload: [String: Any] = ["profiles": [["model": target, "profile": profile]]]
         let body = try JSONSerialization.data(withJSONObject: payload)
         let req = request("admin/model-profiles", method: "PUT", body: body)

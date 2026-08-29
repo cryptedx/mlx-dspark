@@ -89,6 +89,8 @@ struct ModelSettings: Codable, Equatable {
     var mode: String = "auto"
     var maxDraft: String = "auto"
     var confidenceThreshold: Double = 0.0
+    /// `nil` keeps the pre-persistence default for settings saved by older app builds.
+    var keepLoaded: Bool?
     var contextWindow: Int?
     var lookupDrafts: Bool?
     var kvBits: Int?
@@ -96,11 +98,13 @@ struct ModelSettings: Codable, Equatable {
     var enableThinking: Bool?
 
     init(mode: String = "auto", maxDraft: String = "auto", confidenceThreshold: Double = 0.0,
+         keepLoaded: Bool? = nil,
          contextWindow: Int? = nil, lookupDrafts: Bool? = nil, kvBits: Int? = nil,
          cpuPrefill: Bool? = nil, enableThinking: Bool? = nil) {
         self.mode = mode
         self.maxDraft = maxDraft
         self.confidenceThreshold = confidenceThreshold
+        self.keepLoaded = keepLoaded
         self.contextWindow = contextWindow
         self.lookupDrafts = lookupDrafts
         self.kvBits = kvBits
@@ -188,6 +192,9 @@ final class AppModel: ObservableObject {
     /// A model swap that failed. Rendered inline on the Models screen — the server survives a
     /// bad load by design, so the app must too.
     @Published var modelSwitchError: String?
+    /// A cache-only download failed. This is separate from a model swap because no resident
+    /// model was displaced and nothing needs restoring.
+    @Published var downloadError: String?
 
     // MARK: Logs
     @Published var logLines: [LogRow] = []
@@ -238,6 +245,9 @@ final class AppModel: ObservableObject {
     /// A model load/swap in flight (`/admin/load`). The window stays up; screens show
     /// progress inline and generation controls stay disabled via `isServerReady`.
     @Published var isModelLoading = false
+    /// A cache-only download in flight (`/admin/download`). It must not make the active model
+    /// look like it is loading or replace the chat loading state.
+    @Published var isModelDownloading = false
     /// Live weight-download progress while a first-time load fetches from the hub
     /// (`/health.download`, polled during the load). Nil for cached models and old engines.
     @Published var downloadProgress: DownloadProgress?
@@ -454,7 +464,7 @@ final class AppModel: ObservableObject {
     /// fixed port (Settings → Local server) or model folder takes effect without relaunching
     /// the app. The model reloads through the same path a launch uses.
     func restartEngine() async {
-        guard !isModelLoading else { return }
+        guard !isModelLoading, !isModelDownloading else { return }
         let activeSettings = Defaults.modelSettings(for: model)
             ?? selectedHealth.map(ModelSettings.init)
         logStore.note("restarting engine")
@@ -608,7 +618,8 @@ final class AppModel: ObservableObject {
                     confidence: settings.confidenceThreshold,
                     contextWindow: settings.contextWindow, lookupDrafts: settings.lookupDrafts,
                     kvBits: settings.kvBits, cpuPrefill: settings.cpuPrefill,
-                    enableThinking: settings.enableThinking)
+                    enableThinking: settings.enableThinking,
+                    keepLoaded: settings.keepLoaded)
             } catch {
                 logStore.note("couldn't register profile for \(target): \(error.localizedDescription)")
             }
@@ -625,6 +636,7 @@ final class AppModel: ObservableObject {
         generationTask?.cancel()
         prefillProgress = nil
         modelSwitchError = nil
+        downloadError = nil
         isModelLoading = true
         self.model = target
         Defaults.selectedModel = target
@@ -660,10 +672,10 @@ final class AppModel: ObservableObject {
                 try await client.registerModelProfile(
                     target, mode: effective.mode, maxDraft: effective.maxDraft,
                     confidence: effective.confidenceThreshold,
-                    contextWindow: effective.contextWindow,
-                    lookupDrafts: effective.lookupDrafts, kvBits: effective.kvBits,
-                    cpuPrefill: effective.cpuPrefill,
-                    enableThinking: effective.enableThinking)
+                    contextWindow: effective.contextWindow, lookupDrafts: effective.lookupDrafts,
+                    kvBits: effective.kvBits, cpuPrefill: effective.cpuPrefill,
+                    enableThinking: effective.enableThinking,
+                    keepLoaded: effective.keepLoaded)
             }
             _ = try await client.loadModel(
                 target,
@@ -675,7 +687,7 @@ final class AppModel: ObservableObject {
                 kvBits: effective.kvBits,
                 cpuPrefill: effective.cpuPrefill,
                 enableThinking: effective.enableThinking,
-                keepLoaded: true)
+                keepLoaded: effective.keepLoaded ?? true)
             // Re-point health at the new model and restart the telemetry stream (the old one
             // ended when the engine it was streaming from was torn down).
             currentHealth = try? await client.health()
@@ -702,7 +714,8 @@ final class AppModel: ObservableObject {
     /// the partial files; keeping them (the default) means loading this model again later
     /// resumes where it stopped instead of restarting a multi-gigabyte fetch.
     func cancelModelLoad(removePartial: Bool) {
-        guard let client = apiClient, isModelLoading, !isCancellingLoad else { return }
+        guard let client = apiClient, (isModelLoading || isModelDownloading),
+              !isCancellingLoad else { return }
         isCancellingLoad = true
         loadingDetail = removePartial
             ? "Cancelling download and removing the partial files…"
@@ -710,6 +723,45 @@ final class AppModel: ObservableObject {
               + "again later resumes where it stopped."
         logStore.note("cancelling download\(removePartial ? " (removing partial files)" : "")")
         Task { _ = try? await client.cancelLoad(cleanup: removePartial) }
+    }
+
+    /// Download a model into the cache without making it resident.
+    func downloadModel(_ target: String) async {
+        guard let client, !isModelLoading, !isModelDownloading else { return }
+        let target = target.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !target.isEmpty else { return }
+        modelSwitchError = nil
+        downloadError = nil
+        isModelDownloading = true
+        loadingDetail = "Downloading \(target)…"
+        logStore.note("downloading model → \(target)")
+        let poll = Task { [weak self] in
+            while !Task.isCancelled {
+                let health = try? await client.health()
+                await MainActor.run {
+                    self?.downloadProgress = health?.download
+                    self?.loadPhase = health?.phase
+                }
+                try? await Task.sleep(nanoseconds: 1_000_000_000)
+            }
+        }
+        defer {
+            poll.cancel()
+            isModelDownloading = false
+            loadingDetail = nil
+            downloadProgress = nil
+            loadPhase = nil
+            isCancellingLoad = false
+        }
+        do {
+            try await client.downloadModel(target)
+            await refreshDiagnostics()
+        } catch {
+            let cancelled = error.localizedDescription.localizedCaseInsensitiveContains("cancelled")
+            downloadError = cancelled ? nil : error.localizedDescription
+            logStore.note(cancelled ? "download cancelled"
+                          : "model download failed: \(error.localizedDescription)")
+        }
     }
 
     /// Switch to a different target — an in-place hot swap via `/admin/load`, not a restart.
@@ -725,7 +777,8 @@ final class AppModel: ObservableObject {
         let target = target.trimmingCharacters(in: .whitespacesAndNewlines)
         // Re-picking the loaded model is a no-op — but the *same name in the no-model state*
         // (a failed load, an unload) is a legitimate retry, so only bounce when it's serving.
-        guard !target.isEmpty, !(target == model && isSelectedModelResident), apiClient != nil
+        guard !target.isEmpty, !(target == model && isSelectedModelResident), apiClient != nil,
+              !isModelLoading, !isModelDownloading
         else { return }
         let previous = model
         let hadModel = isSelectedModelResident
@@ -757,7 +810,8 @@ final class AppModel: ObservableObject {
     /// Release the loaded model without loading another — frees its memory; the server, the
     /// port, and connected clients' base URLs all survive. `/admin/load` brings one back.
     func unloadModel() async {
-        guard let client = apiClient, isSelectedModelResident else { return }
+        guard let client = apiClient, isSelectedModelResident,
+              !isModelLoading, !isModelDownloading else { return }
         generationTask?.cancel()
         resetModelRuntimeState()
         logStore.note("unloading model")
@@ -767,9 +821,12 @@ final class AppModel: ObservableObject {
     }
 
     func setKeepLoaded(_ target: String, _ keepLoaded: Bool) async {
-        guard let client else { return }
+        guard let client, !isModelLoading, !isModelDownloading else { return }
         do {
             _ = try await client.loadModel(target, keepLoaded: keepLoaded)
+            var settings = Defaults.modelSettings(for: target) ?? ModelSettings()
+            settings.keepLoaded = keepLoaded
+            Defaults.saveModelSettings(settings, for: target)
             currentHealth = try? await client.health()
         } catch {
             modelSwitchError = error.localizedDescription
@@ -784,7 +841,7 @@ final class AppModel: ObservableObject {
                              contextWindow: Int? = nil, lookupDrafts: Bool? = nil,
                              kvBits: Int? = nil, cpuPrefill: Bool? = nil,
                              enableThinking: Bool? = nil) async {
-        guard let client = apiClient else { return }
+        guard let client = apiClient, !isModelLoading, !isModelDownloading else { return }
         generationTask?.cancel()
         prefillProgress = nil
         modelSwitchError = nil
@@ -799,16 +856,26 @@ final class AppModel: ObservableObject {
                       + (confidence.map { " · conf \($0)" } ?? ""))
         let previousSettings = Defaults.modelSettings(for: model)
             ?? selectedHealth.map(ModelSettings.init)
+        let nextMode = mode ?? previousSettings?.mode ?? "auto"
+        let nextMaxDraft = cap ?? previousSettings?.maxDraft ?? "auto"
+        let nextConfidence = confidence ?? previousSettings?.confidenceThreshold ?? 0.0
+        let nextContextWindow = contextWindow.map { $0 == 0 ? nil : $0 }
+            ?? previousSettings?.contextWindow
+        let nextLookupDrafts = lookupDrafts ?? previousSettings?.lookupDrafts
+        let nextKVBits = kvBits ?? previousSettings?.kvBits
+        let nextCPUPrefill = cpuPrefill ?? previousSettings?.cpuPrefill
+        let nextThinking = enableThinking ?? previousSettings?.enableThinking
+        let keepLoaded = previousSettings?.keepLoaded ?? poolStatus(for: model)?.pinned
         let nextSettings = ModelSettings(
-            mode: mode ?? previousSettings?.mode ?? "auto",
-            maxDraft: cap ?? previousSettings?.maxDraft ?? "auto",
-            confidenceThreshold: confidence ?? previousSettings?.confidenceThreshold ?? 0.0,
-            contextWindow: contextWindow.map { $0 == 0 ? nil : $0 }
-                ?? previousSettings?.contextWindow,
-            lookupDrafts: lookupDrafts ?? previousSettings?.lookupDrafts,
-            kvBits: kvBits ?? previousSettings?.kvBits,
-            cpuPrefill: cpuPrefill ?? previousSettings?.cpuPrefill,
-            enableThinking: enableThinking ?? previousSettings?.enableThinking)
+            mode: nextMode,
+            maxDraft: nextMaxDraft,
+            confidenceThreshold: nextConfidence,
+            keepLoaded: keepLoaded,
+            contextWindow: nextContextWindow,
+            lookupDrafts: nextLookupDrafts,
+            kvBits: nextKVBits,
+            cpuPrefill: nextCPUPrefill,
+            enableThinking: nextThinking)
         let poll = Task { [weak self] in
             while !Task.isCancelled {
                 let health = try? await client.health()
@@ -844,7 +911,7 @@ final class AppModel: ObservableObject {
                                            kvBits: nextSettings.kvBits,
                                            cpuPrefill: nextSettings.cpuPrefill,
                                            enableThinking: nextSettings.enableThinking,
-                                           keepLoaded: true, reload: true)
+                                           keepLoaded: nextSettings.keepLoaded ?? true, reload: true)
             Defaults.saveModelSettings(nextSettings, for: model)
             currentHealth = try? await client.health()
             startTelemetry()
@@ -867,7 +934,7 @@ final class AppModel: ObservableObject {
                         ? false : nil),
                     enableThinking: previousSettings?.enableThinking ?? (previousSettings == nil
                         ? true : nil),
-                    keepLoaded: true, reload: true)
+                    keepLoaded: previousSettings?.keepLoaded ?? true, reload: true)
             }
             currentHealth = try? await client.health()
             startTelemetry()
@@ -1020,16 +1087,17 @@ final class AppModel: ObservableObject {
     // MARK: - Chat
 
     func send() {
-        guard let client, !isGenerating else { return }
+        guard let client, !isGenerating, !isModelLoading else { return }
         let text = prompt.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !text.isEmpty else { return }
+        let coldLoad = !isSelectedModelResident
+        guard !coldLoad || !isModelDownloading else { return }
 
         chatError = nil
         messages.append(ChatMessage(role: .user, text: text))
         messages.append(ChatMessage(role: .assistant, text: ""))
         prompt = ""
         isGenerating = true
-        let coldLoad = !isSelectedModelResident
         if coldLoad {
             isModelLoading = true
             loadingDetail = "Loading the selected local model for this request…"

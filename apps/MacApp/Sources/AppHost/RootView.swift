@@ -237,7 +237,7 @@ struct ModelPill: View {
             Button("All models…") { model.screen = .models }
         } label: {
             HStack(spacing: 6) {
-                if model.isModelLoading {
+                if model.isModelLoading || model.isModelDownloading {
                     ProgressView().controlSize(.mini)
                 } else {
                     Circle()
@@ -254,6 +254,9 @@ struct ModelPill: View {
     }
 
     private var title: String {
+        if model.isModelDownloading {
+            return "Downloading…"
+        }
         if model.isModelLoading {
             return "Loading \(model.model.components(separatedBy: "/").last ?? model.model)…"
         }
@@ -272,16 +275,18 @@ struct SidebarFooter: View {
         VStack(alignment: .leading, spacing: 6) {
             Divider()
             HStack(spacing: 6) {
-                if model.isModelLoading {
+                if model.isModelLoading || model.isModelDownloading {
                     ProgressView().controlSize(.mini)
                 } else {
                     Circle()
                         .fill(model.hasLoadedModel ? Theme.verified : Theme.warning)
                         .frame(width: 6, height: 6)
                 }
-                Text(model.isModelLoading
-                     ? "Loading \(model.model.components(separatedBy: "/").last ?? model.model)…"
-                     : model.activeModelName ?? "No model")
+                Text(model.isModelDownloading
+                     ? "Downloading…"
+                     : model.isModelLoading
+                         ? "Loading \(model.model.components(separatedBy: "/").last ?? model.model)…"
+                         : model.activeModelName ?? "No model")
                     .font(.caption).lineLimit(1).truncationMode(.middle)
             }
             if model.liveTokensPerSec > 0 {
@@ -296,10 +301,44 @@ struct SidebarFooter: View {
                 Text("accept \(stats.meanAcceptLen, specifier: "%.2f")")
                     .font(.caption).foregroundStyle(.secondary)
             }
+            if let pool = model.health?.pool {
+                ForEach(pool.models.filter(\.ready)) { status in
+                    ContextUsageRow(name: status.model, used: status.contextTokens,
+                                    limit: status.contextWindow)
+                }
+            } else if let health = model.health, health.isLoaded {
+                ContextUsageRow(name: health.target ?? health.model ?? "Model",
+                                used: health.contextTokens, limit: health.contextWindow)
+            }
         }
         .padding(.horizontal, 12)
         .padding(.bottom, 10)
         .frame(maxWidth: .infinity, alignment: .leading)
+    }
+}
+
+private struct ContextUsageRow: View {
+    let name: String
+    let used: Int?
+    let limit: Int?
+
+    var body: some View {
+        if let used, let limit, limit > 0 {
+            HStack(spacing: 5) {
+                Image(systemName: "text.alignleft").imageScale(.small)
+                Text(shortName).lineLimit(1).truncationMode(.middle)
+                Spacer(minLength: 4)
+                Text("\(used.formatted()) / \(limit.formatted()) ctx")
+                    .monospacedDigit()
+            }
+            .font(.caption2)
+            .foregroundStyle(Double(used) / Double(limit) >= 0.85
+                             ? Theme.warning : .secondary)
+        }
+    }
+
+    private var shortName: String {
+        name.components(separatedBy: "/").last ?? name
     }
 }
 

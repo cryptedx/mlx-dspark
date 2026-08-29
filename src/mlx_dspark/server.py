@@ -2141,10 +2141,13 @@ def make_handler(engine: Engine, api_key: str | None):
             one = ready[0] if len(ready) == 1 else None
             phase = "ok" if ready else ("loading" if status["loading"] else "no_model")
             guard = getattr(engine.runtime, "memory_guard", None)
+            from .download import progress
+
             payload = {
                 "status": phase,
                 "model": one["model"] if one else None,
                 "loading": status["loading"],
+                "download": progress(),
                 "memory_guard": (guard.info() if guard is not None else {"enabled": False}),
                 "pool": status,
             }
@@ -2312,11 +2315,14 @@ def make_handler(engine: Engine, api_key: str | None):
                         "error": status["error"]})
                 # max_draft as a string ("auto" or the pinned/derived cap) so a client can
                 # show the configured knob, not just infer it from round telemetry.
+                from .download import progress
+
                 max_draft = ("auto" if getattr(engine, "cap_controller", None) is not None
                              else str(getattr(engine, "max_draft_tokens", None) or "auto"))
                 return self._send_json(200, {
                     "status": "ok", "model": engine.model_id, "mode": engine.mode,
                     "target": engine.target_repo, "drafter": engine.drafter_repo,
+                    "download": progress(),
                     "max_draft": max_draft,
                     # resolved per pair at load (registry rows measured with lookup off carry
                     # it) — reported so a client shows the actual configuration, like max_draft
@@ -2348,6 +2354,7 @@ def make_handler(engine: Engine, api_key: str | None):
                     # default; serve --no-warmup / the /admin/load "warmup" override turn it off.
                     "warmup": bool(getattr(engine, "warmup_enabled", False)),
                     "context_window": getattr(engine, "context_window", None),
+                    "context_tokens": int(getattr(engine, "_last_context", 0)),
                     # KV-cache quantization for the loaded target: 0 = full precision,
                     # 4/8 = quantized. Always present (0 when off) so a client can gate its
                     # picker on the key's presence — an engine without the /admin/load
@@ -2494,6 +2501,22 @@ def make_handler(engine: Engine, api_key: str | None):
             if route == "/events":
                 return self._model_operation(self._query_value("model"), self._events_stream)
             return self._send_error(404, f"unknown route {self.path}", "not_found")
+
+        def _download(self, req: dict):
+            """Download a model into the local cache without loading it."""
+            model = req.get("model")
+            if not isinstance(model, str) or not model.strip():
+                return self._send_error(400, "download needs a 'model' (repo or path)")
+            model = model.strip()
+            try:
+                from .download import ensure_local
+
+                ensure_local(model)
+            except Exception as e:  # noqa: BLE001 — report download failures to the client
+                traceback.print_exc()
+                return self._send_error(500, f"could not download {model!r}: "
+                                             f"{type(e).__name__}: {e}", "api_error")
+            return self._send_json(200, {"model": model, "downloaded": True})
 
         def _load(self, req: dict):
             """Swap the loaded model in place, keeping the server and its port.
@@ -2797,6 +2820,8 @@ def make_handler(engine: Engine, api_key: str | None):
             try:
                 # /admin/load runs the swap itself, so it must NOT be gated on readiness —
                 # and /admin/unload's whole job is to *leave* the ready state.
+                if route == "/admin/download":
+                    return self._download(req)
                 if route == "/admin/load":
                     return self._load(req)
                 if route == "/admin/load/cancel":

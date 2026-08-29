@@ -176,6 +176,41 @@ def test_profile_change_requires_explicit_reload():
         pool.close()
 
 
+def test_rejected_profile_change_does_not_change_next_pin_preference():
+    pool, _ = _pool()
+    try:
+        pool.admin_load("org/One", keep_loaded=True)
+        pool.register_profile("org/One", {"context_window": 32768, "mode": "lookup"})
+        with pytest.raises(PoolError) as error:
+            pool.admin_load("org/One", options={"context_window": 32768, "mode": "lookup"},
+                            keep_loaded=False)
+        assert error.value.code == "model_profile_conflict"
+
+        pool.unload(all_models=True)
+        with pool.lease("org/One"):
+            pass
+        assert pool.status()["models"][0]["pinned"] is True
+    finally:
+        pool.close()
+
+
+def test_registered_pin_preference_applies_to_the_next_jit_load():
+    pool, _ = _pool()
+    try:
+        pool.register_profile("org/One", {"keep_loaded": True})
+        with pool.lease("org/One"):
+            pass
+        assert pool.status()["models"][0]["pinned"] is True
+
+        pool.unload(all_models=True)
+        pool.register_profile("org/One", {"keep_loaded": False})
+        with pool.lease("org/One"):
+            pass
+        assert pool.status()["models"][0]["pinned"] is False
+    finally:
+        pool.close()
+
+
 def test_failed_replacement_best_effort_restores_victim_and_backs_off_target():
     calls = []
 

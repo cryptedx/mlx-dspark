@@ -194,7 +194,7 @@ struct ModelFoldersCard: View {
                     Button(restarting ? "Restarting…" : "Restart engine now",
                            action: restartEngine)
                         .buttonStyle(.link).font(.caption)
-                        .disabled(restarting || model.isModelLoading)
+                        .disabled(restarting || model.isModelLoading || model.isModelDownloading)
                 }
             }
         }

@@ -103,7 +103,8 @@ struct ServerCard: View {
                     .font(.caption).foregroundStyle(.secondary)
                 Button(restarting ? "Restarting…" : "Apply & restart engine",
                        action: restartEngine)
-                    .font(.caption).disabled(restarting || model.isModelLoading)
+                    .font(.caption).disabled(restarting || model.isModelLoading
+                                              || model.isModelDownloading)
             }
         }
     }
@@ -121,7 +122,7 @@ struct ServerCard: View {
             Button(restarting ? "Restarting…" : "Apply & restart engine",
                    action: restartEngine)
                 .font(.caption)
-                .disabled(restarting || model.isModelLoading)
+                .disabled(restarting || model.isModelLoading || model.isModelDownloading)
             Spacer()
         }
         Text("A fixed port keeps external clients' base URL stable across launches "

@@ -149,6 +149,7 @@ class ModelPool:
         self._clock = clock
         self._slots: dict[str, ModelSlot] = {}
         self._profiles: dict[str, LoadProfile] = {}
+        self._keep_loaded_preferences: dict[str, bool] = {}
         self._lock = threading.RLock()
         self._changed = threading.Condition(self._lock)
         self._request_local = threading.local()
@@ -215,10 +216,20 @@ class ModelPool:
 
     def register_profile(self, model: str, profile: dict[str, Any]) -> dict:
         canonical = self._canonical_model(model, require_local=False)
-        next_profile = self._profile_from(profile)
+        keep_loaded = profile.get("keep_loaded")
+        if keep_loaded is not None and not isinstance(keep_loaded, bool):
+            raise PoolError("model_profile_conflict", "keep_loaded must be a boolean")
+        next_profile = self._profile_from(
+            {key: value for key, value in profile.items() if key != "keep_loaded"})
         with self._changed:
+            if keep_loaded is not None:
+                self._keep_loaded_preferences[canonical] = keep_loaded
             self._profiles[canonical] = next_profile
             slot = self._slots.get(canonical)
+            if slot is not None and keep_loaded is not None and slot.state == "ready":
+                slot.keep_loaded = keep_loaded
+                if not keep_loaded:
+                    slot.last_idle_at = self._clock()
             if slot is not None and slot.state == "ready" and slot.profile != next_profile:
                 slot.profile_pending = True
                 slot.pending_profile = next_profile
@@ -245,9 +256,9 @@ class ModelPool:
                    keep_loaded: bool = True, reload: bool = False) -> dict:
         """Manual load/pin entrypoint.  Manual loads may use the established download path."""
         canonical = self._canonical_model(model, require_local=False)
-        profile = self._profile_from(options or {}) if options else self._profile_for(canonical)
-        if options:
-            self.register_profile(canonical, options)
+        engine_options = {key: value for key, value in (options or {}).items()
+                          if key != "keep_loaded"}
+        profile = self._profile_from(engine_options) if options else self._profile_for(canonical)
         with self._changed:
             slot = self._slots.get(canonical)
             if slot is not None and slot.state == "ready":
@@ -259,11 +270,17 @@ class ModelPool:
                     if slot.leases:
                         raise PoolError("model_active", "model has active or queued requests",
                                         status=409)
-                elif not reload:
-                    slot.keep_loaded = bool(keep_loaded)
-                    if not slot.keep_loaded:
-                        slot.last_idle_at = self._clock()
-                    return self.status()
+            if options:
+                # Validate conflicts before mutating the stored profile or pin preference.
+                # The condition is an RLock, so this stays one atomic state transition.
+                self.register_profile(canonical, options)
+            self._keep_loaded_preferences[canonical] = keep_loaded
+            if (slot is not None and slot.state == "ready"
+                    and slot.profile == profile and not reload):
+                slot.keep_loaded = bool(keep_loaded)
+                if not slot.keep_loaded:
+                    slot.last_idle_at = self._clock()
+                return self.status()
         if reload and slot is not None and slot.state == "ready":
             self._reload(canonical, profile, keep_loaded=keep_loaded)
             return self.status()
@@ -372,10 +389,12 @@ class ModelPool:
                                     status=503, retry_after=retry)
                 profile = self._profile_for(canonical)
                 if slot is None:
-                    slot = ModelSlot(model_id=canonical, profile=profile)
+                    slot = ModelSlot(model_id=canonical, profile=profile,
+                                     keep_loaded=self._keep_loaded_preferences.get(canonical, False))
                     self._slots[canonical] = slot
                 else:
                     slot.profile = profile
+                    slot.keep_loaded = self._keep_loaded_preferences.get(canonical, False)
                     slot.state = "loading"
                     slot.error = None
                     slot.restore_error = None
@@ -883,6 +902,7 @@ class ModelPool:
             "drafter": slot.prepared.drafter_repo if slot.prepared else None,
             "max_draft": max_draft,
             "context_window": getattr(live, "context_window", profile.get("context_window")),
+            "context_tokens": getattr(live, "_last_context", None),
             "max_output_tokens": getattr(live, "max_tokens_cap", profile.get("max_tokens_cap")),
             "supports_reasoning_effort": (
                 bool(getattr(live, "supports_reasoning_effort", False))

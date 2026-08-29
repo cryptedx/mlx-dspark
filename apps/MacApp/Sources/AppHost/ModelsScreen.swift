@@ -18,14 +18,20 @@ struct ModelsScreen: View {
                 if let error = model.modelSwitchError {
                     SwapErrorBanner(message: error) { model.modelSwitchError = nil }
                 }
+                if let error = model.downloadError {
+                    SwapErrorBanner(title: "The model couldn't be downloaded.", message: error) {
+                        model.downloadError = nil
+                    }
+                }
 
-                if model.isModelLoading {
+                if model.isModelLoading || model.isModelDownloading {
                     // The screen most downloads start from is also where they should be
                     // stoppable — the same progress + Cancel the empty chat shows.
                     VStack(alignment: .leading, spacing: 8) {
                         HStack(spacing: 8) {
                             ProgressView().controlSize(.small)
-                            Text("Loading \(model.model.components(separatedBy: "/").last ?? model.model)…")
+                            let name = model.model.components(separatedBy: "/").last ?? model.model
+                            Text(model.loadingDetail ?? "Loading \(name)…")
                                 .font(.callout.weight(.medium))
                         }
                         if let dl = model.downloadProgress {
@@ -63,25 +69,13 @@ struct ModelsScreen: View {
                                  isLoaded: model.poolStatus(for: row.target)?.ready
                                      ?? (model.isServerReady && row.target == model.model),
                                  canLoad: model.poolStatus(for: row.target)?.ready != true
-                                     && !model.isModelLoading) {
+                                     && !model.isModelLoading && !model.isModelDownloading) {
                         Task { await model.switchModel(to: row.target) }
                     }
                 }
                 if model.models.isEmpty {
                     ContentUnavailableView("No models listed", systemImage: "shippingbox")
                         .frame(height: 160)
-                }
-
-                let onDisk = model.installedModels.filter { !$0.isDrafter }
-                if !onDisk.isEmpty {
-                    sectionTitle("On this Mac",
-                                 note: "Already downloaded. Anything here loads instantly; "
-                                     + "unpaired models run with lookup speculation.")
-                    ForEach(onDisk) { installed in
-                        InstalledRowView(installed: installed,
-                                         isLoaded: model.poolStatus(for: installed.repo)?.ready
-                                             ?? (model.isServerReady && installed.repo == model.model))
-                    }
                 }
 
                 let drafters = model.installedModels.filter(\.isDrafter)
@@ -103,6 +97,18 @@ struct ModelsScreen: View {
                             .font(.caption).foregroundStyle(.secondary)
                     }
                     .padding(.top, 2)
+                }
+
+                let onDisk = model.installedModels.filter { !$0.isDrafter }
+                if !onDisk.isEmpty {
+                    sectionTitle("On this Mac",
+                                 note: "Already downloaded. Anything here loads instantly; "
+                                     + "unpaired models run with lookup speculation.")
+                    ForEach(onDisk) { installed in
+                        InstalledRowView(installed: installed,
+                                         isLoaded: model.poolStatus(for: installed.repo)?.ready
+                                             ?? (model.isServerReady && installed.repo == model.model))
+                    }
                 }
             }
             .padding(16)
@@ -148,6 +154,7 @@ struct ModelsScreen: View {
 }
 
 private struct PoolStatusRow: View {
+    @EnvironmentObject private var model: AppModel
     let status: PoolModelStatus
     let togglePin: () -> Void
 
@@ -170,6 +177,7 @@ private struct PoolStatusRow: View {
                 if status.ready {
                     Button(status.pinned ? "Unpin" : "Keep loaded", action: togglePin)
                         .buttonStyle(.bordered).controlSize(.small)
+                        .disabled(model.isModelLoading || model.isModelDownloading)
                 }
             }
             if let reason = status.evictionReason {
@@ -186,7 +194,7 @@ private struct PoolStatusRow: View {
     }
 }
 
-/// Load any Hugging Face repo — the engine serves anything MLX-compatible.
+/// Download any Hugging Face repo — the engine serves anything MLX-compatible.
 struct AnyModelField: View {
     @EnvironmentObject private var model: AppModel
     @State private var repo: String = ""
@@ -198,14 +206,13 @@ struct AnyModelField: View {
                           text: $repo)
                     .textFieldStyle(.roundedBorder)
                     .font(.callout.monospaced())
-                    .onSubmit(load)
-                Button("Load") { load() }
+                    .onSubmit(download)
+                Button("Download") { download() }
                     .buttonStyle(.borderedProminent)
-                    .disabled(trimmed.isEmpty
-                              || (trimmed == model.model && model.isSelectedModelResident))
+                    .disabled(trimmed.isEmpty || model.isModelLoading || model.isModelDownloading)
             }
-            Text("Downloads on first load. A known target gets its drafter pair; anything "
-                 + "else runs with drafter-free lookup speculation.")
+            Text("Downloads the model to this Mac without loading it. Start it later from "
+                 + "the installed-model row.")
                 .font(.caption2).foregroundStyle(.secondary)
         }
         .padding(12)
@@ -217,23 +224,31 @@ struct AnyModelField: View {
         repo.trimmingCharacters(in: .whitespacesAndNewlines)
     }
 
-    private func load() {
+    private func download() {
         let target = trimmed
         guard !target.isEmpty else { return }
         repo = ""
-        Task { await model.switchModel(to: target) }
+        Task { await model.downloadModel(target) }
     }
 }
 
 struct SwapErrorBanner: View {
+    let title: String
     let message: String
     let dismiss: () -> Void
+
+    init(title: String = "That model didn't load — the previous one was restored.",
+         message: String, dismiss: @escaping () -> Void) {
+        self.title = title
+        self.message = message
+        self.dismiss = dismiss
+    }
 
     var body: some View {
         HStack(alignment: .firstTextBaseline, spacing: 8) {
             Image(systemName: "exclamationmark.triangle.fill").foregroundStyle(Theme.warning)
             VStack(alignment: .leading, spacing: 2) {
-                Text("That model didn't load — the previous one was restored.")
+                Text(title)
                     .font(.callout.weight(.medium))
                 Text(message).font(.caption).foregroundStyle(.secondary)
                     .textSelection(.enabled)
@@ -419,6 +434,7 @@ struct InstalledRowView: View {
             if !isLoaded {
                 Button("Load") { Task { await model.switchModel(to: installed.repo) } }
                     .controlSize(.small)
+                    .disabled(model.isModelLoading || model.isModelDownloading)
             }
             RevealButton(path: installed.path)
             // LM Studio's downloads and the user's own model folders are not our files —
@@ -430,7 +446,7 @@ struct InstalledRowView: View {
                     Image(systemName: "trash").imageScale(.small)
                 }
                 .buttonStyle(.borderless)
-                .disabled(isLoaded)
+                .disabled(isLoaded || model.isModelLoading || model.isModelDownloading)
                 .help(isLoaded ? "Can't delete the loaded model" : "Move to Trash")
             }
         }
