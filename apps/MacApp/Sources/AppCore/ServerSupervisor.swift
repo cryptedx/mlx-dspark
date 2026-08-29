@@ -35,13 +35,20 @@ public struct ServerConfig: Equatable, Sendable {
     public var lookupDrafts: Bool?
     public var kvBits: Int?
     public var enableThinking: Bool?
+    /// Opt-in multi-model JIT server. The app uses this by default; the false default keeps
+    /// callers compiled against older engines and tests backward-compatible.
+    public var onDemandModels: Bool
+    public var maxResidentModels: Int
+    public var idleTTLSeconds: Int
 
     public init(model: String? = nil, mode: String = "auto", maxDraft: String? = "auto",
                 contextWindow: Int? = nil,
                 host: String = "127.0.0.1", apiKey: String? = nil, port: Int = 0,
                 portIsExplicit: Bool = true, modelDirs: [String] = [],
                 confidenceThreshold: Double = 0.0, lookupDrafts: Bool? = nil,
-                kvBits: Int? = nil, enableThinking: Bool? = nil) {
+                kvBits: Int? = nil, enableThinking: Bool? = nil,
+                onDemandModels: Bool = false, maxResidentModels: Int = 2,
+                idleTTLSeconds: Int = 900) {
         self.model = model
         self.mode = mode
         self.maxDraft = maxDraft
@@ -55,6 +62,9 @@ public struct ServerConfig: Equatable, Sendable {
         self.lookupDrafts = lookupDrafts
         self.kvBits = kvBits
         self.enableThinking = enableThinking
+        self.onDemandModels = onDemandModels
+        self.maxResidentModels = maxResidentModels
+        self.idleTTLSeconds = idleTTLSeconds
     }
 
     /// Serve on every interface (`0.0.0.0`) or loopback only.
@@ -146,6 +156,11 @@ public actor ServerSupervisor {
         // the engine's default target instead.
         if let model = config.model { args.append(contentsOf: ["--model", model]) }
         else { args.append("--no-model") }
+        if config.onDemandModels {
+            args.append("--on-demand-models")
+            args.append(contentsOf: ["--max-resident-models", String(config.maxResidentModels)])
+            args.append(contentsOf: ["--idle-ttl", String(max(0, config.idleTTLSeconds))])
+        }
         if let maxDraft = config.maxDraft { args.append(contentsOf: ["--max-draft", maxDraft]) }
         if let contextWindow = config.contextWindow {
             args.append(contentsOf: ["--context-window", String(contextWindow)])

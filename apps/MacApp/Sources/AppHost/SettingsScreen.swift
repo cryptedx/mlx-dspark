@@ -511,6 +511,7 @@ struct ServerCard: View {
     @State private var serveOnLAN = Defaults.serveOnLAN
     @State private var apiKeyEnabled = Defaults.apiKeyEnabled
     @State private var apiKey = Defaults.apiKey
+    @State private var idleTTLSeconds = Defaults.modelIdleTTLSeconds
     @State private var addresses = LocalNetwork.ipv4Addresses()
 
     /// Settings differ from what the running engine was started with.
@@ -518,6 +519,7 @@ struct ServerCard: View {
         serveOnLAN != model.runningServeOnLAN
             || (apiKeyEnabled && !apiKey.trimmingCharacters(in: .whitespaces).isEmpty
                 ? apiKey.trimmingCharacters(in: .whitespaces) : nil) != model.runningAPIKey
+            || idleTTLSeconds != model.runningModelIdleTTLSeconds
     }
 
     var body: some View {
@@ -556,6 +558,8 @@ struct ServerCard: View {
                 }
                 Divider()
                 portRow
+                Divider()
+                poolRow
                 Divider()
                 networkRows
             }
@@ -606,7 +610,7 @@ struct ServerCard: View {
         }
         if needsRestart {
             HStack(spacing: 8) {
-                Text("Network settings apply when the engine restarts.")
+                Text("Server settings apply when the engine restarts.")
                     .font(.caption).foregroundStyle(.secondary)
                 Button(restarting ? "Restarting…" : "Apply & restart engine") {
                     commitPort()
@@ -641,6 +645,18 @@ struct ServerCard: View {
              + "(default \(Defaults.defaultEnginePort); if something else holds it, the "
              + "app falls back to an automatic port). Blank = always automatic. "
              + "Ports 1024–65535.")
+            .font(.caption).foregroundStyle(.secondary)
+    }
+
+    @ViewBuilder private var poolRow: some View {
+        Picker("Idle model unload", selection: $idleTTLSeconds) {
+            Text("Off").tag(0)
+            Text("15 minutes").tag(900)
+            Text("60 minutes").tag(3600)
+        }
+        .onChange(of: idleTTLSeconds) { _, value in Defaults.modelIdleTTLSeconds = value }
+        Text("Unpinned, idle models leave the two-slot pool after this delay. Pins keep their "
+             + "weights resident; prefix caches may still be cleared under memory pressure.")
             .font(.caption).foregroundStyle(.secondary)
     }
 

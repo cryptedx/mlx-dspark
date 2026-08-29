@@ -232,7 +232,7 @@ struct ModelPill: View {
             }
             Divider()
             if model.isServerReady {
-                Button("Unload model") { Task { await model.unloadModel() } }
+                Button("Unload selected model") { Task { await model.unloadModel() } }
             }
             Button("All models…") { model.screen = .models }
         } label: {

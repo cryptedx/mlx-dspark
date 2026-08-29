@@ -239,8 +239,8 @@ public struct BandwidthInfo: Decodable, Sendable, Equatable {
 extension APIClient {
     /// Chip, measured bandwidth, what macOS sees, the loaded model's footprint and its
     /// roofline. Answers model-less too (chip/bandwidth/memory only).
-    public func machine() async throws -> MachineReport {
-        let (data, response) = try await session.data(for: request("machine"))
+    public func machine(model: String? = nil) async throws -> MachineReport {
+        let (data, response) = try await session.data(for: modelRequest("machine", model: model))
         try Self.check(response, data)
         return try JSONDecoder().decode(MachineReport.self, from: data)
     }

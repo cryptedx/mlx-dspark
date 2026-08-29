@@ -362,12 +362,16 @@ struct EmptyChat: View {
                     DownloadProgressRow(progress: dl)
                 }
                 EngineLogTail()
-            } else if !model.isServerReady {
-                Text("No model loaded.").font(.title3.weight(.medium))
-                Text("Pick one from the model menu in the toolbar, or browse everything "
-                     + "on the Models screen.")
+            } else if !model.isServerRunning {
+                Text("Server is not ready.").font(.title3.weight(.medium))
+                Text("Wait for the local server to start, then send a message.")
                     .foregroundStyle(.secondary)
-                Button("Choose a model") { model.screen = .models }
+            } else if !model.isSelectedModelResident {
+                Text("Ask anything.").font(.title3.weight(.medium))
+                Text("Your selected local model loads on this first request. Use Models to "
+                     + "load and keep a model resident ahead of time.")
+                    .foregroundStyle(.secondary)
+                Button("Browse models") { model.screen = .models }
                     .buttonStyle(.borderedProminent)
                     .padding(.top, 4)
             } else {
@@ -562,7 +566,7 @@ struct Composer: View {
                     Button("Send", systemImage: "arrow.up") { model.send() }
                         .labelStyle(.iconOnly)
                         .keyboardShortcut(.return, modifiers: [])
-                        .disabled(!model.isServerReady
+                        .disabled(!model.isServerRunning
                                   || model.prompt.trimmingCharacters(in: .whitespaces).isEmpty)
                 }
             }

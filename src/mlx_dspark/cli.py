@@ -309,6 +309,8 @@ def cmd_generate(argv: list[str]) -> None:
 
 
 def cmd_serve(argv: list[str]) -> None:
+    from .mlx_runtime import MLXRuntime
+    from .model_pool import ModelPool
     from .server import Engine, EngineHolder, maybe_batch_engine, run_server
 
     ap = argparse.ArgumentParser(prog="mlx-dspark serve",
@@ -327,6 +329,14 @@ def cmd_serve(argv: list[str]) -> None:
                          "generation routes answer 503 until a client loads one via "
                          "POST /admin/load (model pickers still work — /doctor and "
                          "/admin/models answer model-free)")
+    ap.add_argument("--on-demand-models", action="store_true",
+                    help="keep up to two locally installed primary models resident and select "
+                         "them per request. Starts model-free; a request JIT-loads its model. "
+                         "The Mac app registers per-model profiles through /admin/model-profiles.")
+    ap.add_argument("--max-resident-models", type=int, choices=[1, 2], default=2,
+                    help="primary model slots for --on-demand-models (default 2)")
+    ap.add_argument("--idle-ttl", default="900", metavar="SECONDS|off",
+                    help="unpin-and-unload delay for on-demand models (default 900; off = never)")
     ap.add_argument("--drafter", default=None, help="drafter repo/path (overrides auto-resolve)")
     ap.add_argument("--family", choices=["gemma4", "qwen3"], default=None,
                     help=argparse.SUPPRESS)          # deprecated alias for --model
@@ -448,6 +458,18 @@ def cmd_serve(argv: list[str]) -> None:
                     help="spill the prefix cache to --prefix-cache-dir once it exceeds this many MB "
                          "of RAM (0 = never spill; requires --prefix-cache-dir)")
     args = ap.parse_args(argv)
+    try:
+        idle_ttl_s = 0.0 if str(args.idle_ttl).lower() == "off" else float(args.idle_ttl)
+        if idle_ttl_s < 0:
+            raise ValueError
+    except ValueError:
+        ap.error("--idle-ttl must be a non-negative number of seconds or 'off'")
+    if args.on_demand_models:
+        args.no_model = True
+        if args.max_batch != 1:
+            ap.error("--on-demand-models requires --max-batch 1")
+        if args.host not in {"127.0.0.1", "::1", "localhost"} and not args.api_key:
+            ap.error("--on-demand-models on a network host requires --api-key")
     if args.trust_remote_code:
         from . import load as _load
 
@@ -496,6 +518,17 @@ def cmd_serve(argv: list[str]) -> None:
         "kv_bits": args.kv_bits or None,
         "context_window": args.context_window,
     }
+    if args.on_demand_models:
+        # The pool is intentionally model-free at process start.  Profiles supplied by the
+        # Mac app override this default session profile before the first request is accepted.
+        pool_defaults = dict(load_kwargs)
+        pool_defaults["context_window"] = (
+            args.context_window if args.context_window is not None else 65536)
+        runtime = MLXRuntime(wired_limit=args.wired_limit, memory_guard=args.memory_guard)
+        pool = ModelPool(runtime=runtime, loader=Engine.load, load_defaults=pool_defaults,
+                         max_resident=args.max_resident_models, idle_ttl_s=idle_ttl_s)
+        run_server(pool, host=args.host, port=args.port, api_key=args.api_key)
+        return
     if args.no_model:
         # Fast start with nothing resident: the first /admin/load brings a model up on the
         # same port (the Mac app's instant-launch path).

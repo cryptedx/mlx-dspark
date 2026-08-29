@@ -39,6 +39,16 @@ struct ModelsScreen: View {
 
                 header
 
+                if !model.poolModelStatuses.isEmpty {
+                    sectionTitle("Model pool", note: "Resident models share one MLX runtime. "
+                                 + "Pins keep weights resident; caches may still be reclaimed.")
+                    ForEach(model.poolModelStatuses) { status in
+                        PoolStatusRow(status: status) {
+                            Task { await model.setKeepLoaded(status.model, !status.pinned) }
+                        }
+                    }
+                }
+
                 AnyModelField()
 
                 sectionTitle("Measured pairs",
@@ -49,8 +59,11 @@ struct ModelsScreen: View {
                 ForEach(model.models) { row in
                     // `model.model` is the SELECTED target, set before a load succeeds — on
                     // its own it left a "loaded" badge on a model whose load failed (PR #18).
-                    ModelRowView(row: row, isLoaded: model.isServerReady && row.target == model.model,
-                                 canLoad: row.target != model.model && !model.isModelLoading) {
+                    ModelRowView(row: row,
+                                 isLoaded: model.poolStatus(for: row.target)?.ready
+                                     ?? (model.isServerReady && row.target == model.model),
+                                 canLoad: model.poolStatus(for: row.target)?.ready != true
+                                     && !model.isModelLoading) {
                         Task { await model.switchModel(to: row.target) }
                     }
                 }
@@ -66,7 +79,8 @@ struct ModelsScreen: View {
                                      + "unpaired models run with lookup speculation.")
                     ForEach(onDisk) { installed in
                         InstalledRowView(installed: installed,
-                                         isLoaded: model.isServerReady && installed.repo == model.model)
+                                         isLoaded: model.poolStatus(for: installed.repo)?.ready
+                                             ?? (model.isServerReady && installed.repo == model.model))
                     }
                 }
 
@@ -108,8 +122,8 @@ struct ModelsScreen: View {
             }
             .font(.caption).foregroundStyle(.secondary)
 
-            Text("Switching swaps the model in place — the server and its port stay up, so "
-                 + "connected agents keep working.")
+            Text("Models load on demand over one stable port. You can keep up to two primary "
+                 + "models resident for chat and compression.")
                 .font(.caption).foregroundStyle(.secondary)
 
             // The badges are M4 Pro measurements. Say how this Mac compares instead of
@@ -133,6 +147,45 @@ struct ModelsScreen: View {
     }
 }
 
+private struct PoolStatusRow: View {
+    let status: PoolModelStatus
+    let togglePin: () -> Void
+
+    private var shortName: String {
+        status.model.components(separatedBy: "/").last ?? status.model
+    }
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 5) {
+            HStack(spacing: 8) {
+                Text(shortName).font(.callout.weight(.medium))
+                Text(status.state.capitalized)
+                    .font(.caption2.weight(.medium))
+                    .foregroundStyle(status.ready ? Theme.verified : Theme.warning)
+                if status.pinned {
+                    Label("Pinned", systemImage: "pin.fill")
+                        .font(.caption2).foregroundStyle(.secondary)
+                }
+                Spacer()
+                if status.ready {
+                    Button(status.pinned ? "Unpin" : "Keep loaded", action: togglePin)
+                        .buttonStyle(.bordered).controlSize(.small)
+                }
+            }
+            if let reason = status.evictionReason {
+                Text("Last transition: \(reason)").font(.caption).foregroundStyle(.secondary)
+            }
+            if let warning = status.warning ?? status.restoreError ?? status.error {
+                Text(warning).font(.caption).foregroundStyle(Theme.warning)
+                    .textSelection(.enabled)
+            }
+        }
+        .padding(10)
+        .background(Theme.cardFill, in: RoundedRectangle(cornerRadius: 8))
+        .overlay(RoundedRectangle(cornerRadius: 8).strokeBorder(Theme.cardStroke, lineWidth: 1))
+    }
+}
+
 /// Load any Hugging Face repo — the engine serves anything MLX-compatible.
 struct AnyModelField: View {
     @EnvironmentObject private var model: AppModel
@@ -148,7 +201,8 @@ struct AnyModelField: View {
                     .onSubmit(load)
                 Button("Load") { load() }
                     .buttonStyle(.borderedProminent)
-                    .disabled(trimmed.isEmpty || trimmed == model.model)
+                    .disabled(trimmed.isEmpty
+                              || (trimmed == model.model && model.isSelectedModelResident))
             }
             Text("Downloads on first load. A known target gets its drafter pair; anything "
                  + "else runs with drafter-free lookup speculation.")

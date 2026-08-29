@@ -6,6 +6,48 @@ import Foundation
 // to every response — that non-standard block is where the whole point of this project lives
 // (accept length, cap, lookup rounds), so it is a first-class type here, not an afterthought.
 
+/// One primary model in the on-demand resident pool. Pins and residency are session-only; the
+/// Mac app remains the durable source for each model's loading profile.
+public struct PoolModelStatus: Decodable, Sendable, Equatable, Identifiable {
+    public var id: String { model }
+    public let model: String
+    public let state: String
+    public let ready: Bool
+    public let pinned: Bool
+    public let leases: Int
+    public let error: String?
+    public let restoreError: String?
+    public let profilePendingReload: Bool
+    public let evictionReason: String?
+    public let warning: String?
+    public let mode: String?
+    public let target: String?
+    public let drafter: String?
+
+    enum CodingKeys: String, CodingKey {
+        case model, state, ready, pinned, leases, error, warning, mode, target, drafter
+        case restoreError = "restore_error"
+        case profilePendingReload = "profile_pending_reload"
+        case evictionReason = "eviction_reason"
+    }
+}
+
+public struct ModelPoolInfo: Decodable, Sendable, Equatable {
+    public let ready: Bool
+    public let loading: Bool
+    public let model: String?
+    public let error: String?
+    public let maxResidentModels: Int
+    public let idleTTLSeconds: Double
+    public let models: [PoolModelStatus]
+
+    enum CodingKeys: String, CodingKey {
+        case ready, loading, model, error, models
+        case maxResidentModels = "max_resident_models"
+        case idleTTLSeconds = "idle_ttl_seconds"
+    }
+}
+
 public struct HealthInfo: Decodable, Sendable, Equatable {
     public struct CPUSplitInfo: Decodable, Sendable, Equatable {
         public let minRows: Int
@@ -71,9 +113,12 @@ public struct HealthInfo: Decodable, Sendable, Equatable {
     /// WorkBuddy have no reasoning toggle for local models, so this server default is what
     /// they live with. Optional: presence = the override exists on this engine.
     public let thinkingDefault: String?
+    /// Present only for the opt-in on-demand server. It makes every resident model's state
+    /// visible without pretending a two-model pool has an implicit current model.
+    public let pool: ModelPoolInfo?
 
     enum CodingKeys: String, CodingKey {
-        case status, model, mode, target, drafter, download, phase, warnings
+        case status, model, mode, target, drafter, download, phase, warnings, pool
         case thinkingDefault = "thinking_default"
         case maxDraft = "max_draft"
         case contextWindow = "context_window"
@@ -178,6 +223,7 @@ public struct LoadStatus: Decodable, Sendable {
     public let loading: Bool
     public let model: String?
     public let error: String?
+    public let models: [PoolModelStatus]?
 }
 
 /// One event from a streaming completion.
@@ -218,7 +264,7 @@ public struct APIClient: Sendable {
         let config = URLSessionConfiguration.ephemeral
         // Generation can legitimately go quiet for a while on a big prompt; the default 60 s
         // resource timeout would kill a long agent-style request mid-stream.
-        config.timeoutIntervalForRequest = 60
+        config.timeoutIntervalForRequest = 1800
         config.timeoutIntervalForResource = 3600
         self.session = URLSession(configuration: config)
     }
@@ -233,6 +279,16 @@ public struct APIClient: Sendable {
             req.httpBody = body
             req.setValue("application/json", forHTTPHeaderField: "Content-Type")
         }
+        return req
+    }
+
+    func modelRequest(_ path: String, model: String?) -> URLRequest {
+        var req = request(path)
+        guard let model, !model.isEmpty,
+              var parts = URLComponents(url: req.url!, resolvingAgainstBaseURL: false)
+        else { return req }
+        parts.queryItems = [URLQueryItem(name: "model", value: model)]
+        req.url = parts.url
         return req
     }
 
@@ -252,17 +308,17 @@ public struct APIClient: Sendable {
 
     /// Raw `/metrics` JSON. Left untyped for now — the shape grows with the engine, and the
     /// Lab screens will decode the parts they need.
-    public func metrics() async throws -> [String: Any] {
-        let (data, response) = try await session.data(for: request("metrics"))
+    public func metrics(model: String? = nil) async throws -> [String: Any] {
+        let (data, response) = try await session.data(for: modelRequest("metrics", model: model))
         try Self.check(response, data)
         return (try JSONSerialization.jsonObject(with: data) as? [String: Any]) ?? [:]
     }
 
     /// What the loaded model holds resident right now — the MLX allocator state that
     /// `/metrics` reports alongside the throughput stats.
-    public func engineMemory() async throws -> EngineMemory? {
+    public func engineMemory(model: String? = nil) async throws -> EngineMemory? {
         struct Envelope: Decodable { let memory: EngineMemory? }
-        let (data, response) = try await session.data(for: request("metrics"))
+        let (data, response) = try await session.data(for: modelRequest("metrics", model: model))
         try Self.check(response, data)
         return try JSONDecoder().decode(Envelope.self, from: data).memory
     }
@@ -281,8 +337,11 @@ public struct APIClient: Sendable {
                           lookupDrafts: Bool? = nil,
                           kvBits: Int? = nil,
                           cpuPrefill: Bool? = nil,
-                          enableThinking: Bool? = nil) async throws -> LoadStatus {
-        var payload: [String: Any] = ["model": target]
+                          enableThinking: Bool? = nil,
+                          keepLoaded: Bool = true,
+                          reload: Bool = false) async throws -> LoadStatus {
+        var payload: [String: Any] = ["model": target, "keep_loaded": keepLoaded,
+                                      "reload": reload]
         if let mode { payload["mode"] = mode }
         if let maxDraft {
             payload["max_draft"] = Int(maxDraft).map { $0 as Any } ?? maxDraft
@@ -311,6 +370,27 @@ public struct APIClient: Sendable {
         return try JSONDecoder().decode(LoadStatus.self, from: data)
     }
 
+    /// Register the app's persistent settings as a session-only JIT load profile. This never
+    /// loads weights: absent context/mode extras keep the server's safe defaults instead of
+    /// leaking another resident model's options into this one.
+    public func registerModelProfile(_ target: String, mode: String,
+                                     maxDraft: String, confidence: Double,
+                                     contextWindow: Int?, lookupDrafts: Bool?, kvBits: Int?,
+                                     cpuPrefill: Bool?, enableThinking: Bool?) async throws {
+        var profile: [String: Any] = ["mode": mode, "max_draft": Int(maxDraft) ?? maxDraft,
+                                      "confidence_threshold": confidence]
+        if let contextWindow { profile["context_window"] = contextWindow }
+        if let lookupDrafts { profile["lookup_drafts"] = lookupDrafts }
+        if let kvBits { profile["kv_bits"] = kvBits }
+        if let cpuPrefill { profile["cpu_split"] = cpuPrefill ? "auto" : 0 }
+        if let enableThinking { profile["enable_thinking"] = enableThinking }
+        let payload: [String: Any] = ["profiles": [["model": target, "profile": profile]]]
+        let body = try JSONSerialization.data(withJSONObject: payload)
+        let req = request("admin/model-profiles", method: "PUT", body: body)
+        let (data, response) = try await session.data(for: req)
+        try Self.check(response, data)
+    }
+
     /// Cancel an in-flight first-time download (`/admin/load/cancel`). The blocked
     /// `/admin/load` then fails cleanly and the server stays up, model-less. `cleanup`
     /// also removes the partial files; the default keeps them so loading the same model
@@ -334,8 +414,10 @@ public struct APIClient: Sendable {
     /// Release the loaded model without loading another (`/admin/unload`) — frees its memory;
     /// the server and its port stay up and `/admin/load` brings a model back.
     @discardableResult
-    public func unloadModel() async throws -> LoadStatus {
-        let body = try JSONSerialization.data(withJSONObject: [String: Any]())
+    public func unloadModel(model: String? = nil, all: Bool = false) async throws -> LoadStatus {
+        var payload: [String: Any] = ["all": all]
+        if let model { payload["model"] = model }
+        let body = try JSONSerialization.data(withJSONObject: payload)
         let req = request("admin/unload", method: "POST", body: body)
         let (data, response) = try await session.data(for: req)
         try Self.check(response, data)
@@ -343,8 +425,8 @@ public struct APIClient: Sendable {
     }
 
     /// This machine's measured verify/drafter cost curves (Lab → Curves).
-    public func calibration() async throws -> Calibration {
-        let (data, response) = try await session.data(for: request("calibration"))
+    public func calibration(model: String? = nil) async throws -> Calibration {
+        let (data, response) = try await session.data(for: modelRequest("calibration", model: model))
         try Self.check(response, data)
         return try JSONDecoder().decode(Calibration.self, from: data)
     }
@@ -363,9 +445,11 @@ public struct APIClient: Sendable {
     }
 
     /// Recent rounds plus aggregates, without holding a stream open.
-    public func rounds(limit: Int = 128) async throws -> (rounds: [RoundEvent], stats: RoundStats) {
-        var req = request("rounds")
-        req.url = URL(string: "\(baseURL.absoluteString)/rounds?limit=\(limit)")
+    public func rounds(limit: Int = 128, model: String? = nil) async throws -> (rounds: [RoundEvent], stats: RoundStats) {
+        var req = modelRequest("rounds", model: model)
+        var parts = URLComponents(url: req.url!, resolvingAgainstBaseURL: false)!
+        parts.queryItems = (parts.queryItems ?? []) + [URLQueryItem(name: "limit", value: String(limit))]
+        req.url = parts.url
         let (data, response) = try await session.data(for: req)
         try Self.check(response, data)
         struct Payload: Decodable { let rounds: [RoundEvent]; let stats: RoundStats }
@@ -378,11 +462,11 @@ public struct APIClient: Sendable {
     /// Not scoped to a request: this reports every round the engine runs, whoever asked for
     /// it. That is what lets the app show a live accept ribbon while a *different* client —
     /// Claude Code, say — is the one generating.
-    public func streamRounds() -> AsyncThrowingStream<TelemetryEvent, Error> {
+    public func streamRounds(model: String? = nil) -> AsyncThrowingStream<TelemetryEvent, Error> {
         AsyncThrowingStream { continuation in
             let task = Task {
                 do {
-                    let (bytes, response) = try await session.bytes(for: request("events"))
+                    let (bytes, response) = try await session.bytes(for: modelRequest("events", model: model))
                     if let http = response as? HTTPURLResponse, http.statusCode != 200 {
                         throw APIError.badStatus(http.statusCode, "")
                     }
@@ -450,7 +534,8 @@ public struct APIClient: Sendable {
             let task = Task {
                 do {
                     let body = try JSONSerialization.data(withJSONObject: payload)
-                    let req = request("v1/chat/completions", method: "POST", body: body)
+                    var req = request("v1/chat/completions", method: "POST", body: body)
+                    req.timeoutInterval = 1800       // includes a first on-demand cold load
                     let (bytes, response) = try await session.bytes(for: req)
                     if let http = response as? HTTPURLResponse, http.statusCode != 200 {
                         var detail = ""

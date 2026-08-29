@@ -167,6 +167,15 @@ class MemoryGuard:
         if pending == "critical" or self._clock() - self._pending_since >= self.defer_s:
             self._run_pending()
 
+    def on_idle(self) -> None:
+        """Run a pending shed once the owner reports that no lease is active.
+
+        A pool has several engines and no single engine's round hook can represent them all.
+        Its final lease release calls this method instead.
+        """
+        if self._pending is not None and not self._is_busy() and self._submit is not None:
+            self._submit(self._run_pending)
+
     def _run_pending(self) -> dict | None:
         with self._lock:
             level, self._pending = self._pending, None

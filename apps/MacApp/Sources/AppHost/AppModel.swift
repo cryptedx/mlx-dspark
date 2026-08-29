@@ -224,6 +224,7 @@ final class AppModel: ObservableObject {
     /// hint while they differ from the saved preferences).
     @Published var runningServeOnLAN = false
     @Published var runningAPIKey: String?
+    @Published var runningModelIdleTTLSeconds = Defaults.modelIdleTTLSeconds
 
     /// Extra model folders the engine searches (Settings → Model folders). Takes effect when
     /// the engine (re)starts.
@@ -359,31 +360,29 @@ final class AppModel: ObservableObject {
         await startServer(model: model)
     }
 
-    /// Spawn the server and load a target. Called from onboarding's pick, or straight from
-    /// boot on a return visit. The server itself starts model-less (`--no-model`, seconds) and
-    /// the window opens immediately; the model then loads *inside* the running window with
-    /// inline progress, instead of gating the whole app behind a loading screen.
+    /// Spawn the server model-free. The on-demand pool receives persistent app profiles but
+    /// loads nothing until Chat, Hermes, or an explicit "Load and keep" action asks for it.
     func startServer(model: String, preserving settings: ModelSettings? = nil) async {
         self.model = model
         Defaults.selectedModel = model
         let settings = settings ?? Defaults.modelSettings(for: model)
         guard await spawnServer(preserving: settings) else { return }
-        phase = .ready
         await refreshDiagnostics()               // model pickers work before anything loads
-        let loaded: Bool
-        if currentHealth?.isLoaded == true {
-            // The compatibility fallback in spawnServer already loaded it during spawn.
+        if currentHealth?.pool != nil {
+            await registerSavedProfiles(selected: model, preserving: settings)
+        } else if currentHealth?.isLoaded == true {
+            // Compatibility fallback for an older engine that cannot start the pool.
             startTelemetry()
             startMemoryPolling()
-            loaded = true
         } else {
-            loaded = await loadModel(model, applying: settings)
+            _ = await loadModel(model, applying: settings)
         }
-        if loaded, isFirstRun {
+        phase = .ready
+        if isFirstRun {
             // The plan's "hooked" moment: straight from onboarding into a race the user
             // can run — not a blank chat that hides why this app exists.
             isFirstRun = false
-            if detail.showsLab {
+            if currentHealth?.isLoaded == true, detail.showsLab {
                 Defaults.labTab = "Race"
                 screen = .lab
                 showLabWelcome = true
@@ -502,9 +501,12 @@ final class AppModel: ObservableObject {
                                   confidenceThreshold: settings?.confidenceThreshold ?? 0.0,
                                   lookupDrafts: settings?.lookupDrafts,
                                   kvBits: settings?.kvBits,
-                                  enableThinking: settings?.enableThinking)
+                                  enableThinking: settings?.enableThinking,
+                                  onDemandModels: true, maxResidentModels: 2,
+                                  idleTTLSeconds: Defaults.modelIdleTTLSeconds)
         do {
             let port = try await supervisor.start(config: config)
+            runningModelIdleTTLSeconds = config.idleTTLSeconds
             return await connect(port: port)
         } catch {
             // An engine below this app's floor doesn't know `--no-model`, and an offline
@@ -517,7 +519,9 @@ final class AppModel: ObservableObject {
             do {
                 var inlineConfig = config
                 inlineConfig.model = model
+                inlineConfig.onDemandModels = false
                 let port = try await supervisor.start(config: inlineConfig)
+                runningModelIdleTTLSeconds = inlineConfig.idleTTLSeconds
                 return await connect(port: port)
             } catch {
                 fail(error)
@@ -536,6 +540,26 @@ final class AppModel: ObservableObject {
         self.apiClient = client
         currentHealth = try? await client.health()
         return true
+    }
+
+    private func registerSavedProfiles(selected: String, preserving: ModelSettings?) async {
+        guard let client else { return }
+        var profiles = Defaults.savedModelSettings()
+        profiles[selected] = preserving ?? profiles[selected]
+            ?? Defaults.modelSettings(for: selected) ?? ModelSettings()
+        for (target, settings) in profiles.sorted(by: { $0.key < $1.key }) {
+            do {
+                try await client.registerModelProfile(
+                    target, mode: settings.mode, maxDraft: settings.maxDraft,
+                    confidence: settings.confidenceThreshold,
+                    contextWindow: settings.contextWindow, lookupDrafts: settings.lookupDrafts,
+                    kvBits: settings.kvBits, cpuPrefill: settings.cpuPrefill,
+                    enableThinking: settings.enableThinking)
+            } catch {
+                logStore.note("couldn't register profile for \(target): \(error.localizedDescription)")
+            }
+        }
+        currentHealth = try? await client.health()
     }
 
     /// Load `target` into the running server (`/admin/load`) with inline progress — the
@@ -577,18 +601,27 @@ final class AppModel: ObservableObject {
             isCancellingLoad = false
         }
         do {
-            // Context is sticky in the running engine, so 0 is required when a model has no
-            // saved cap; it means "use this model's own maximum" and prevents leakage.
+            let effective = profile ?? ModelSettings()
+            if currentHealth?.pool != nil {
+                try await client.registerModelProfile(
+                    target, mode: effective.mode, maxDraft: effective.maxDraft,
+                    confidence: effective.confidenceThreshold,
+                    contextWindow: effective.contextWindow,
+                    lookupDrafts: effective.lookupDrafts, kvBits: effective.kvBits,
+                    cpuPrefill: effective.cpuPrefill,
+                    enableThinking: effective.enableThinking)
+            }
             _ = try await client.loadModel(
                 target,
-                mode: profile?.mode,
-                maxDraft: profile?.maxDraft,
-                confidence: profile.map { $0.confidenceThreshold },
-                contextWindow: profile.map { $0.contextWindow ?? 0 } ?? 0,
-                lookupDrafts: profile?.lookupDrafts,
-                kvBits: profile?.kvBits,
-                cpuPrefill: profile?.cpuPrefill ?? (profile == nil ? false : nil),
-                enableThinking: profile?.enableThinking ?? (profile == nil ? true : nil))
+                mode: effective.mode,
+                maxDraft: effective.maxDraft,
+                confidence: effective.confidenceThreshold,
+                contextWindow: effective.contextWindow,
+                lookupDrafts: effective.lookupDrafts,
+                kvBits: effective.kvBits,
+                cpuPrefill: effective.cpuPrefill,
+                enableThinking: effective.enableThinking,
+                keepLoaded: true)
             // Re-point health at the new model and restart the telemetry stream (the old one
             // ended when the engine it was streaming from was torn down).
             currentHealth = try? await client.health()
@@ -638,10 +671,11 @@ final class AppModel: ObservableObject {
         let target = target.trimmingCharacters(in: .whitespacesAndNewlines)
         // Re-picking the loaded model is a no-op — but the *same name in the no-model state*
         // (a failed load, an unload) is a legitimate retry, so only bounce when it's serving.
-        guard !target.isEmpty, !(target == model && isServerReady), apiClient != nil
+        guard !target.isEmpty, !(target == model && isSelectedModelResident), apiClient != nil
         else { return }
         let previous = model
-        let hadModel = isServerReady
+        let hadModel = isSelectedModelResident
+        let usesPool = currentHealth?.pool != nil
         loadingDetail = "Swapping models in place — the server and its port stay up, so "
             + "connected agents keep working. A model that isn't downloaded yet downloads first."
         logStore.note("switching model → \(target)")
@@ -651,7 +685,11 @@ final class AppModel: ObservableObject {
         // model's error visible through the restore (loadModel clears it on entry).
         let failure = modelSwitchError
         screen = .models                         // the inline error lives there
-        if hadModel, previous != target {
+        if usesPool {
+            self.model = previous
+            Defaults.selectedModel = previous
+        }
+        if !usesPool, hadModel, previous != target {
             self.model = previous
             Defaults.selectedModel = previous
             loadingDetail = "Restoring \(previous.components(separatedBy: "/").last ?? previous)…"
@@ -665,7 +703,7 @@ final class AppModel: ObservableObject {
     /// Release the loaded model without loading another — frees its memory; the server, the
     /// port, and connected clients' base URLs all survive. `/admin/load` brings one back.
     func unloadModel() async {
-        guard let client = apiClient, isServerReady else { return }
+        guard let client = apiClient, isSelectedModelResident else { return }
         generationTask?.cancel()
         prefillProgress = nil
         rounds = []
@@ -674,9 +712,19 @@ final class AppModel: ObservableObject {
         memory = nil
         liveTokensPerSec = 0
         logStore.note("unloading model")
-        _ = try? await client.unloadModel()
+        _ = try? await client.unloadModel(model: model)
         currentHealth = try? await client.health()
         await refreshDiagnostics()
+    }
+
+    func setKeepLoaded(_ target: String, _ keepLoaded: Bool) async {
+        guard let client else { return }
+        do {
+            _ = try await client.loadModel(target, keepLoaded: keepLoaded)
+            currentHealth = try? await client.health()
+        } catch {
+            modelSwitchError = error.localizedDescription
+        }
     }
 
     /// Reload the *current* model with a different decode mode and/or draft cap — the
@@ -730,13 +778,24 @@ final class AppModel: ObservableObject {
             loadPhase = nil
         }
         do {
-            _ = try await client.loadModel(model, mode: mode, maxDraft: cap,
-                                           confidence: confidence,
-                                           contextWindow: contextWindow,
-                                           lookupDrafts: lookupDrafts,
-                                           kvBits: kvBits,
-                                           cpuPrefill: cpuPrefill,
-                                           enableThinking: enableThinking)
+            if currentHealth?.pool != nil {
+                try await client.registerModelProfile(
+                    model, mode: nextSettings.mode, maxDraft: nextSettings.maxDraft,
+                    confidence: nextSettings.confidenceThreshold,
+                    contextWindow: nextSettings.contextWindow,
+                    lookupDrafts: nextSettings.lookupDrafts, kvBits: nextSettings.kvBits,
+                    cpuPrefill: nextSettings.cpuPrefill,
+                    enableThinking: nextSettings.enableThinking)
+            }
+            _ = try await client.loadModel(model, mode: nextSettings.mode,
+                                           maxDraft: nextSettings.maxDraft,
+                                           confidence: nextSettings.confidenceThreshold,
+                                           contextWindow: nextSettings.contextWindow,
+                                           lookupDrafts: nextSettings.lookupDrafts,
+                                           kvBits: nextSettings.kvBits,
+                                           cpuPrefill: nextSettings.cpuPrefill,
+                                           enableThinking: nextSettings.enableThinking,
+                                           keepLoaded: true, reload: true)
             Defaults.saveModelSettings(nextSettings, for: model)
             currentHealth = try? await client.health()
             startTelemetry()
@@ -744,20 +803,23 @@ final class AppModel: ObservableObject {
             await refreshDiagnostics()
         } catch {
             modelSwitchError = error.localizedDescription
-            // The engine is modelless after a failed load — restore the previous profile.
-            // If even that fails, the server survives model-less; the picker still works.
-            _ = try? await client.loadModel(
-                model,
-                mode: previousSettings?.mode,
-                maxDraft: previousSettings?.maxDraft,
-                confidence: previousSettings.map { $0.confidenceThreshold },
-                contextWindow: previousSettings.map { $0.contextWindow ?? 0 } ?? 0,
-                lookupDrafts: previousSettings?.lookupDrafts,
-                kvBits: previousSettings?.kvBits,
-                cpuPrefill: previousSettings?.cpuPrefill ?? (previousSettings == nil
-                    ? false : nil),
-                enableThinking: previousSettings?.enableThinking ?? (previousSettings == nil
-                    ? true : nil))
+            // The pool restores a displaced model itself on a best-effort basis. Older
+            // single-model servers still need the historical explicit restore.
+            if currentHealth?.pool == nil {
+                _ = try? await client.loadModel(
+                    model,
+                    mode: previousSettings?.mode,
+                    maxDraft: previousSettings?.maxDraft,
+                    confidence: previousSettings.map { $0.confidenceThreshold },
+                    contextWindow: previousSettings.map { $0.contextWindow ?? 0 } ?? 0,
+                    lookupDrafts: previousSettings?.lookupDrafts,
+                    kvBits: previousSettings?.kvBits,
+                    cpuPrefill: previousSettings?.cpuPrefill ?? (previousSettings == nil
+                        ? false : nil),
+                    enableThinking: previousSettings?.enableThinking ?? (previousSettings == nil
+                        ? true : nil),
+                    keepLoaded: true, reload: true)
+            }
             currentHealth = try? await client.health()
             startTelemetry()
             startMemoryPolling()
@@ -790,12 +852,13 @@ final class AppModel: ObservableObject {
         prefillProgress = nil
         // No model → /events answers 503; don't spin against it. The next successful load
         // calls this again.
-        guard let client, isServerReady else { return }
+        guard let client, isSelectedModelResident else { return }
         telemetryTask?.cancel()
         telemetryTask = Task { [weak self] in
+            guard let selectedModel = self?.model else { return }
             while !Task.isCancelled {
                 do {
-                    for try await event in client.streamRounds() {
+                    for try await event in client.streamRounds(model: selectedModel) {
                         guard let self else { return }
                         switch event {
                         case .round(let round):
@@ -864,17 +927,17 @@ final class AppModel: ObservableObject {
     /// sysctls on the server side, so a relaxed cadence is plenty. Older engines have no
     /// `/machine` — then the allocator half still comes from `/metrics`.
     private func startMemoryPolling() {
-        guard let client, isServerReady else { return }    // /metrics 503s with no model
+        guard let client, isSelectedModelResident else { return }    // /metrics needs a model
         memoryTask?.cancel()
         memoryTask = Task { [weak self] in
             var hasMachine = true
             while !Task.isCancelled {
-                if hasMachine, let report = try? await client.machine() {
+                if hasMachine, let report = try? await client.machine(model: self?.model) {
                     self?.machine = report
                     if let allocator = report.memory.allocator { self?.memory = allocator }
                 } else {
                     hasMachine = false
-                    if let memory = try? await client.engineMemory() {
+                    if let memory = try? await client.engineMemory(model: self?.model) {
                         self?.memory = memory
                     }
                 }
@@ -887,7 +950,7 @@ final class AppModel: ObservableObject {
         guard let client else { return }
         async let report = try? client.doctor()
         async let inventory = try? client.modelInventory()
-        async let curves = try? client.calibration()
+        let curves = isSelectedModelResident ? try? await client.calibration(model: model) : nil
         doctorReport = await report
         if let inventory = await inventory {
             models = inventory.models
@@ -895,13 +958,13 @@ final class AppModel: ObservableObject {
             diskUsage = inventory.disk
             bandwidth = inventory.bandwidth
         }
-        calibration = await curves
+        calibration = curves
     }
 
     /// Pull the latest aggregates (the SSE stream only pushes them periodically).
     func refreshStats() async {
         guard let client else { return }
-        if let (_, latest) = try? await client.rounds(limit: 1) { stats = latest }
+        if let (_, latest) = try? await client.rounds(limit: 1, model: model) { stats = latest }
     }
 
     // MARK: - Chat
@@ -916,6 +979,11 @@ final class AppModel: ObservableObject {
         messages.append(ChatMessage(role: .assistant, text: ""))
         prompt = ""
         isGenerating = true
+        let coldLoad = !isSelectedModelResident
+        if coldLoad {
+            isModelLoading = true
+            loadingDetail = "Loading the selected local model for this request…"
+        }
         persistCurrentSession()
 
         // History goes back *without* the reasoning traces: `<think>` blocks are the model
@@ -931,6 +999,12 @@ final class AppModel: ObservableObject {
 
         generationTask = Task { [weak self] in
             guard let self else { return }
+            defer {
+                if coldLoad {
+                    self.isModelLoading = false
+                    self.loadingDetail = nil
+                }
+            }
             // Coalesce streaming updates. Appending to a plain local string is O(1); the
             // growing message is committed to the @Published `messages` array — which triggers
             // a full markdown re-parse and invalidates every observing view — at most ~15x/s
@@ -1011,6 +1085,10 @@ final class AppModel: ObservableObject {
             flush(force: true)     // commit any tokens buffered since the last throttled flush
             self.isGenerating = false
             self.persistCurrentSession()
+            self.currentHealth = try? await client.health()
+            self.startTelemetry()
+            self.startMemoryPolling()
+            await self.refreshDiagnostics()
             await self.refreshStats()
         }
     }
@@ -1103,10 +1181,26 @@ final class AppModel: ObservableObject {
         return nil
     }
 
-    /// A model is loaded and serving. (The server being *up* is a weaker state — it answers
-    /// `/health` with `no_model` from the fast-launch or unloaded state, where generation
-    /// controls must stay disabled but model pickers work.)
-    var isServerReady: Bool { health?.isLoaded ?? false }
+    /// The HTTP server is reachable, even if its on-demand pool is still empty. Chat can use
+    /// this state: its first request holds a lease and loads the requested local model.
+    var isServerRunning: Bool {
+        apiClient != nil && phase == .ready
+    }
+
+    var poolModelStatuses: [PoolModelStatus] { health?.pool?.models ?? [] }
+
+    func poolStatus(for target: String) -> PoolModelStatus? {
+        poolModelStatuses.first { $0.model == target || $0.target == target }
+    }
+
+    /// The selected target is actually resident and able to serve. This remains narrower than
+    /// `isServerRunning` for diagnostics, decoder settings, and the explicit unload control.
+    var isSelectedModelResident: Bool {
+        if health?.pool != nil { return poolStatus(for: model)?.ready == true }
+        return health?.isLoaded == true
+    }
+
+    var isServerReady: Bool { isSelectedModelResident }
 
     /// Whether the loaded model's chat template reads `reasoning_effort` (`/health` reports
     /// it), so the chat settings only show an effort picker where it does something.
@@ -1305,6 +1399,17 @@ enum Defaults {
         store.set(data, forKey: modelSettingsPrefix + model)
     }
 
+    static func savedModelSettings() -> [String: ModelSettings] {
+        var result: [String: ModelSettings] = [:]
+        for (key, value) in store.dictionaryRepresentation() where key.hasPrefix(modelSettingsPrefix) {
+            guard let data = value as? Data,
+                  let settings = try? JSONDecoder().decode(ModelSettings.self, from: data)
+            else { continue }
+            result[String(key.dropFirst(modelSettingsPrefix.count))] = settings
+        }
+        return result
+    }
+
     private static var legacyContextWindow: Int? {
         guard store.object(forKey: "contextWindow") != nil else { return nil }
         let value = store.integer(forKey: "contextWindow")
@@ -1359,6 +1464,16 @@ enum Defaults {
     }
 
     static var engineHost: String { serveOnLAN ? "0.0.0.0" : "127.0.0.1" }
+
+    /// Idle pool eviction policy. 0 = off; the UI intentionally exposes only the tested
+    /// choices from the product plan rather than an arbitrary duration field.
+    static var modelIdleTTLSeconds: Int {
+        get {
+            let value = store.object(forKey: "modelIdleTTLSeconds") as? Int ?? 900
+            return [0, 900, 3600].contains(value) ? value : 900
+        }
+        set { store.set(newValue, forKey: "modelIdleTTLSeconds") }
+    }
 
     /// Extra folders the engine searches for MLX checkpoints (Settings → Model folders);
     /// passed to the engine as `MLX_DSPARK_MODEL_DIRS`.

@@ -28,6 +28,7 @@ import contextlib
 import json
 import os
 import queue as _queue
+import signal
 import sys
 import threading
 import time
@@ -49,6 +50,7 @@ from .generate import (
 )
 from .load import apply_wired_limit, load_dflash, load_drafter, load_target, resolve_mode
 from .lookup import lookup_generate
+from .model_pool import PROFILE_KEYS, ModelPool, PoolError
 from .prefix_cache import PrefixCache, _lcp, target_cache_reusable
 from .roofline import (
     REFERENCE_BANDWIDTH_GB_S,
@@ -356,6 +358,7 @@ class Engine:
         sdpa_split: bool = False,
         cpu_split: dict | None = None,
         executor: ThreadPoolExecutor | None = None,
+        owns_executor: bool | None = None,
         depth_capper=None,
     ):
         self.target = target
@@ -416,8 +419,10 @@ class Engine:
         # thread-local one), so models must be LOADED on the same thread that generates —
         # Engine.load() does that and hands the executor in; a single worker also keeps every
         # cache create/reuse on one thread and serializes requests.
+        self._owns_executor = executor is None if owns_executor is None else owns_executor
         self._executor = executor or ThreadPoolExecutor(max_workers=1,
                                                         thread_name_prefix="mlx-gen")
+        self._closed = False
         self.created = int(time.time())
         # Per-round telemetry: fed by the decode loops, read by /events and /metrics. Kept
         # even with no subscribers so /metrics can report position acceptance (d_0, d_1, ...)
@@ -615,6 +620,8 @@ class Engine:
         warmup: bool = True,                     # run a throwaway generation on load to warm kernels
         on_warmup=None,                          # zero-arg callback fired right before the warmup pass
         memory_guard: bool = True,               # shed prefix cache + allocator cache under OS pressure
+        executor: ThreadPoolExecutor | None = None,
+        owns_executor: bool | None = None,
     ) -> Engine:
         if mode != "auto" and mode not in MODES:
             raise ValueError(f"mode must be one of {MODES} or 'auto', got {mode!r}")
@@ -644,7 +651,8 @@ class Engine:
         # Load (and calibrate) on the SAME single thread that will generate: MLX ops/arrays
         # are thread/stream-affine, and mlx-vlm's gemma load switches the loading thread's
         # default stream — anything left lazy would then be unevaluatable from another thread.
-        executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="mlx-gen")
+        owns_executor = executor is None if owns_executor is None else owns_executor
+        executor = executor or ThreadPoolExecutor(max_workers=1, thread_name_prefix="mlx-gen")
 
         def _load_models():
             tgt, tok = load_target(target_repo, require_tap=mode in ("dspark", "dflash"),
@@ -797,6 +805,7 @@ class Engine:
                   sdpa_split=sdpa_split_active,
                   cpu_split=split_cfg,
                   executor=executor,
+                  owns_executor=owns_executor,
                   depth_capper=depth_capper)
         eng.warmup_enabled = warmup
         eng.load_notes = load_notes
@@ -1218,27 +1227,36 @@ class Engine:
         }
 
     def close(self) -> None:
-        """Release the models and stop the generation thread. Used by hot model-swapping
-        (``/admin/load``) to free GPU memory before the replacement loads.
+        """Release this engine's resources without stopping a shared runtime worker.
 
-        Shuts the executor down *waiting* for any in-flight generation to finish — a swap must
-        never yank the model out from under a running request — then drops references and asks
-        MLX to release the freed Metal buffers so the next model has room. Idempotent.
+        Hot swaps still own their private executor.  A resident-model pool instead passes its
+        process-wide serial executor and keeps it alive for the next engine.
         """
-        import mlx.core as mx
-
+        if self._closed:
+            return
+        self._closed = True
         if self.memory_guard is not None:
             self.memory_guard.stop()
             self.memory_guard = None
-        self._executor.shutdown(wait=True)
-        if self.prefix is not None:
-            self.prefix.reset()
-            self.prefix = None
-        self.target = None
-        self.drafter = None
-        self.cap_controller = None
-        with contextlib.suppress(Exception):  # best-effort; a failed cache clear is not fatal
-            mx.clear_cache()                 # return the just-freed buffers to the OS
+
+        def release() -> None:
+            if self.prefix is not None:
+                self.prefix.reset()
+                self.prefix = None
+            self.target = None
+            self.drafter = None
+            self.cap_controller = None
+            if self._owns_executor:
+                with contextlib.suppress(Exception):
+                    import mlx.core as mx
+
+                    mx.clear_cache()
+
+        # ``SerialExecutor`` executes this inline when close() was itself requested by the
+        # MLX worker, avoiding a same-worker submit/result deadlock.
+        self._executor.submit(release).result()
+        if self._owns_executor:
+            self._executor.shutdown(wait=True)
 
     def race_arms_available(self) -> list[str]:
         """Which decode strategies can be raced with what is currently loaded.
@@ -2049,6 +2067,7 @@ def _clamp_tokens(v, default: int = 2048, cap: int = 32768) -> int:
 def make_handler(engine: Engine, api_key: str | None):
     """Build a request-handler class bound to this engine (needed since BaseHTTPRequestHandler
     is instantiated per-connection by the server and can't take extra constructor args)."""
+    is_pool = isinstance(engine, ModelPool)
 
     class Handler(BaseHTTPRequestHandler):
         protocol_version = "HTTP/1.1"
@@ -2069,7 +2088,7 @@ def make_handler(engine: Engine, api_key: str | None):
         def _cors(self):
             self.send_header("Access-Control-Allow-Origin", "*")
             self.send_header("Access-Control-Allow-Headers", "Authorization, Content-Type")
-            self.send_header("Access-Control-Allow-Methods", "GET, POST, OPTIONS")
+            self.send_header("Access-Control-Allow-Methods", "GET, POST, PUT, OPTIONS")
 
         def _send_json(self, status: int, obj: dict):
             body = json.dumps(obj).encode("utf-8")
@@ -2084,6 +2103,55 @@ def make_handler(engine: Engine, api_key: str | None):
         def _send_error(self, status: int, message: str, etype: str = "invalid_request_error"):
             self._send_json(status, {"error": {"message": message, "type": etype,
                                                "code": status}})
+
+        def _send_pool_error(self, error: PoolError):
+            """Stable errors for a caller that can decide whether retrying makes sense."""
+            body = json.dumps({"error": {"message": str(error),
+                                           "type": "model_pool_error",
+                                           "code": error.code}}).encode("utf-8")
+            self.send_response(error.status)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(body)))
+            self.send_header("Connection", "close")
+            if error.retry_after is not None:
+                self.send_header("Retry-After", str(error.retry_after))
+            self._cors()
+            self.end_headers()
+            self.wfile.write(body)
+
+        def _model_operation(self, requested_model, operation):
+            """Run one handler operation with a pool lease, including its streamed lifetime."""
+            if not is_pool:
+                return operation()
+            try:
+                with engine.lease(requested_model):
+                    return operation()
+            except PoolError as error:
+                return self._send_pool_error(error)
+
+        def _pool_health(self) -> dict:
+            status = engine.status()
+            ready = [slot for slot in status["models"] if slot["state"] == "ready"]
+            one = ready[0] if len(ready) == 1 else None
+            phase = "ok" if ready else ("loading" if status["loading"] else "no_model")
+            guard = getattr(engine.runtime, "memory_guard", None)
+            payload = {
+                "status": phase,
+                "model": one["model"] if one else None,
+                "loading": status["loading"],
+                "memory_guard": (guard.info() if guard is not None else {"enabled": False}),
+                "pool": status,
+            }
+            if one is not None:
+                payload.update({
+                    "mode": one["mode"],
+                    "target": one["target"],
+                    "drafter": one["drafter"],
+                    "context_window": one.get("context_window"),
+                    "kv_bits": one.get("kv_bits", 0),
+                    "max_output_tokens": one.get("max_output_tokens"),
+                })
+            return payload
 
         def _sse_start(self):
             self.send_response(200)
@@ -2141,6 +2209,10 @@ def make_handler(engine: Engine, api_key: str | None):
             """503 while a model swap is in flight, or while no model is loaded at all
             (``--no-model`` start, ``/admin/unload``). Everything but /health, the admin
             status/inventory routes and /doctor needs a loaded model, so they gate on this."""
+            if is_pool:
+                # A pool starts model-less on purpose.  The model route below acquires a lease
+                # and performs the local JIT load, so it must not be blocked here.
+                return True
             if isinstance(engine, EngineHolder) and not engine.ready:
                 self._send_error(
                     503,
@@ -2149,6 +2221,61 @@ def make_handler(engine: Engine, api_key: str | None):
                     "service_unavailable")
                 return False
             return True
+
+        def _pool_load(self, req: dict):
+            model = req.get("model")
+            if not isinstance(model, str) or not model.strip():
+                return self._send_error(400, "load needs a 'model' (repo or path)")
+            keep_loaded = req.get("keep_loaded", True)
+            reload = req.get("reload", False)
+            if not isinstance(keep_loaded, bool) or not isinstance(reload, bool):
+                return self._send_error(400, "'keep_loaded' and 'reload' must be booleans")
+            profile = req.get("profile")
+            if profile is not None and not isinstance(profile, dict):
+                return self._send_error(400, "'profile' must be an object")
+            options = dict(profile or {})
+            for key in set(PROFILE_KEYS) | {"max_draft", "confidence"}:
+                if key in req:
+                    options[key] = req[key]
+            try:
+                return self._send_json(200, engine.admin_load(
+                    model, options=options or None, keep_loaded=keep_loaded, reload=reload))
+            except PoolError as error:
+                return self._send_pool_error(error)
+
+        def _pool_unload(self, req: dict):
+            all_models = req.get("all", False)
+            if not isinstance(all_models, bool):
+                return self._send_error(400, "'all' must be a boolean")
+            model = req.get("model")
+            if model is not None and not isinstance(model, str):
+                return self._send_error(400, "'model' must be a string")
+            try:
+                return self._send_json(200, engine.unload(model, all_models=all_models))
+            except PoolError as error:
+                return self._send_pool_error(error)
+
+        def _register_model_profiles(self, req: dict):
+            raw = req.get("profiles")
+            if raw is None and "model" in req:
+                raw = [{"model": req.get("model"),
+                        "profile": req.get("profile", {
+                            key: value for key, value in req.items()
+                            if key not in {"model", "profiles"}})}]
+            if isinstance(raw, dict):
+                raw = [{"model": model, "profile": profile}
+                       for model, profile in raw.items()]
+            if not isinstance(raw, list) or not raw:
+                return self._send_error(400, "profiles must be a non-empty list or model mapping")
+            registered = []
+            for entry in raw:
+                if not isinstance(entry, dict) or not isinstance(entry.get("model"), str):
+                    return self._send_error(400, "each profile needs a string model")
+                profile = entry.get("profile")
+                if not isinstance(profile, dict):
+                    return self._send_error(400, "each profile needs an object profile")
+                registered.append(engine.register_profile(entry["model"], profile))
+            return self._send_json(200, {"profiles": registered})
 
         def do_GET(self):
             route = self._route()
@@ -2162,6 +2289,8 @@ def make_handler(engine: Engine, api_key: str | None):
                 # Answers even mid-swap so a client can poll the status through a model change.
                 # "loading" and "no_model" are distinct states: a client should wait through
                 # the first and offer a model picker on the second.
+                if is_pool:
+                    return self._send_json(200, self._pool_health())
                 if isinstance(engine, EngineHolder) and not engine.ready:
                     status = engine.status()
                     return self._send_json(200, {
@@ -2246,6 +2375,8 @@ def make_handler(engine: Engine, api_key: str | None):
                         "reasoning_effort"),
                 })
             if route == "/admin/status":
+                if is_pool:
+                    return self._send_json(200, engine.status())
                 if isinstance(engine, EngineHolder):
                     return self._send_json(200, engine.status())
                 return self._send_json(200, {"ready": True, "loading": False,
@@ -2261,14 +2392,21 @@ def make_handler(engine: Engine, api_key: str | None):
                 from .load import extra_model_roots
 
                 installed = installed_models()
-                loaded = (engine.target_repo
-                          if not isinstance(engine, EngineHolder) or engine.ready else None)
+                if is_pool:
+                    resident = [slot["model"] for slot in engine.status()["models"]
+                                if slot["state"] == "ready"]
+                    loaded = resident[0] if len(resident) == 1 else None
+                else:
+                    resident = None
+                    loaded = (engine.target_repo
+                              if not isinstance(engine, EngineHolder) or engine.ready else None)
                 from .diagnostics import bandwidth_info
 
                 return self._send_json(200, {"models": model_inventory(),
                                              "installed": installed,
                                              "disk": disk_usage(installed),
                                              "loaded": loaded,
+                                             "resident": resident,
                                              # the user's MLX_DSPARK_MODEL_DIRS roots, so a
                                              # picker can say where a "model_dirs" row came from
                                              "model_dirs": list(extra_model_roots()),
@@ -2280,33 +2418,52 @@ def make_handler(engine: Engine, api_key: str | None):
                 # Chip, measured bandwidth, OS memory view, the loaded model's footprint and
                 # its single-stream roofline. Answers model-less too (chip/bandwidth/memory
                 # only) so a picker can scale estimates before anything is loaded.
+                if is_pool:
+                    requested = self._query_value("model")
+                    if not requested:
+                        return self._send_json(200, {**_machine_basics(),
+                                                      "pool": engine.status()})
+                    return self._model_operation(
+                        requested,
+                        lambda: self._send_json(200, getattr(engine, "machine_report", None)()
+                                                if getattr(engine, "machine_report", None)
+                                                else _machine_basics()))
                 if isinstance(engine, EngineHolder) and not engine.ready:
                     return self._send_json(200, _machine_basics())
                 report = getattr(engine, "machine_report", None)
                 if report is None:
                     return self._send_json(200, _machine_basics())
                 return self._send_json(200, report())
+            if route in ("/v1/models", "/models"):
+                if is_pool:
+                    return self._send_json(200, engine.models_payload())
+                if not self._require_ready():
+                    return
+                return self._send_json(200, self._models_payload())
             if not self._require_ready():
                 return
-            if route in ("/v1/models", "/models"):
-                return self._send_json(200, self._models_payload())
             if route == "/metrics":
-                from .diagnostics import memory_info
+                def metrics_reply():
+                    from .diagnostics import memory_info
 
-                payload = engine.metrics()
-                # Allocator state rides along so a client can show what the loaded model
-                # actually holds resident — added handler-side so every engine (incl.
-                # BatchEngine) reports it without owning the concern.
-                payload["memory"] = memory_info()
-                # What the OS sees (pressure, swap, free %) — the "mysteriously half speed"
-                # diagnostics; a few sysctls, so a client can poll it with the allocator.
-                payload["system"] = system_memory()
-                payload["verdict"] = getattr(engine, "last_verdict", None)
-                guard = getattr(engine, "memory_guard", None)
-                payload["memory_guard"] = guard.info() if guard is not None else {"enabled": False}
-                return self._send_json(200, payload)
+                    payload = engine.metrics()
+                    # Allocator state rides along so a client can show what the loaded model
+                    # actually holds resident — added handler-side so every engine (incl.
+                    # BatchEngine) reports it without owning the concern.
+                    payload["memory"] = memory_info()
+                    # What the OS sees (pressure, swap, free %) — the "mysteriously half speed"
+                    # diagnostics; a few sysctls, so a client can poll it with the allocator.
+                    payload["system"] = system_memory()
+                    payload["verdict"] = getattr(engine, "last_verdict", None)
+                    guard = getattr(engine, "memory_guard", None)
+                    payload["memory_guard"] = guard.info() if guard is not None else {"enabled": False}
+                    return self._send_json(200, payload)
+
+                return self._model_operation(self._query_value("model"), metrics_reply)
             if route == "/calibration":
-                return self._send_json(200, engine.calibration())
+                return self._model_operation(
+                    self._query_value("model"),
+                    lambda: self._send_json(200, engine.calibration()))
             if route == "/admin/integrations":
                 from .integrations import integrations
 
@@ -2316,19 +2473,23 @@ def make_handler(engine: Engine, api_key: str | None):
                 host = self.headers.get("Host") or f"{self.server.server_address[0]}:" \
                     f"{self.server.server_address[1]}"
                 base = f"http://{host}"
-                return self._send_json(200, {
-                    "base_url": base,
-                    "model": engine.model_id,
-                    "integrations": integrations(base, engine.model_id, api_key),
-                })
+                return self._model_operation(
+                    self._query_value("model"),
+                    lambda: self._send_json(200, {
+                        "base_url": base,
+                        "model": engine.model_id,
+                        "integrations": integrations(base, engine.model_id, api_key),
+                    }))
             if route == "/rounds":
                 # Recent rounds as one JSON blob — the pull-based sibling of /events, for
                 # clients that would rather poll than hold a stream open.
                 limit = self._query_int("limit", 128)
-                return self._send_json(200, {"rounds": engine.rounds.snapshot(limit),
-                                             "stats": engine.rounds.stats()})
+                return self._model_operation(
+                    self._query_value("model"),
+                    lambda: self._send_json(200, {"rounds": engine.rounds.snapshot(limit),
+                                                  "stats": engine.rounds.stats()}))
             if route == "/events":
-                return self._events_stream()
+                return self._model_operation(self._query_value("model"), self._events_stream)
             return self._send_error(404, f"unknown route {self.path}", "not_found")
 
         def _load(self, req: dict):
@@ -2338,6 +2499,8 @@ def make_handler(engine: Engine, api_key: str | None):
             at this server keeps working across a model change — a full restart would move the
             kernel-assigned port out from under it.
             """
+            if is_pool:
+                return self._pool_load(req)
             if not isinstance(engine, EngineHolder):
                 return self._send_error(501, "this server was not started with hot-swap support")
             model = req.get("model")
@@ -2546,6 +2709,12 @@ def make_handler(engine: Engine, api_key: str | None):
             except (TypeError, ValueError):
                 return default
 
+        def _query_value(self, name: str) -> str | None:
+            from urllib.parse import parse_qs
+
+            value = parse_qs(urlsplit(self.path).query).get(name, [None])[0]
+            return value if isinstance(value, str) and value.strip() else None
+
         def _events_stream(self):
             """SSE stream of live generation telemetry.
 
@@ -2576,6 +2745,8 @@ def make_handler(engine: Engine, api_key: str | None):
                         event = q.get(timeout=1.0)
                     except _queue.Empty:
                         idle += 1.0
+                        if is_pool and engine.is_closing:
+                            break
                         # Without traffic a proxy or the client can time the socket out; a
                         # comment frame is the cheapest legal keep-alive.
                         self._sse_comment("keepalive")
@@ -2617,6 +2788,8 @@ def make_handler(engine: Engine, api_key: str | None):
                 if anthropic:
                     return self._send_json(400, A.error_body(f"invalid JSON body: {e}"))
                 return self._send_error(400, f"invalid JSON body: {e}")
+            if not isinstance(req, dict):
+                return self._send_error(400, "JSON body must be an object")
 
             try:
                 # /admin/load runs the swap itself, so it must NOT be gated on readiness —
@@ -2635,6 +2808,8 @@ def make_handler(engine: Engine, api_key: str | None):
                         return self._send_error(400, "'cleanup' must be a boolean")
                     return self._send_json(200, cancel_current(cleanup=bool(cleanup)))
                 if route == "/admin/unload":
+                    if is_pool:
+                        return self._pool_unload(req)
                     if not isinstance(engine, EngineHolder):
                         return self._send_error(
                             501, "this server was not started with hot-swap support")
@@ -2642,17 +2817,19 @@ def make_handler(engine: Engine, api_key: str | None):
                 if not self._require_ready():
                     return
                 if route in ("/v1/chat/completions", "/chat/completions"):
-                    return self._chat(req)
+                    return self._model_operation(req.get("model"), lambda: self._chat(req))
                 if route in ("/v1/completions", "/completions"):
-                    return self._completions(req)
+                    return self._model_operation(req.get("model"), lambda: self._completions(req))
                 if route in ("/v1/messages", "/messages"):
-                    return self._messages(req)
+                    return self._model_operation(req.get("model"), lambda: self._messages(req))
                 if route in ("/v1/messages/count_tokens", "/messages/count_tokens"):
-                    return self._count_tokens(req)
+                    return self._model_operation(req.get("model"), lambda: self._count_tokens(req))
                 if route in ("/v1/responses", "/responses"):
-                    return self._responses(req)
+                    return self._model_operation(req.get("model"), lambda: self._responses(req))
                 if route == "/admin/race":
-                    return self._race(req)
+                    return self._model_operation(req.get("model"), lambda: self._race(req))
+            except PoolError as error:
+                return self._send_pool_error(error)
             except (BrokenPipeError, ConnectionResetError):
                 # Client hung up mid-stream; nothing more to do — but say so. Swallowing it
                 # silently left no server-side record at all, which made a stalled client
@@ -2672,6 +2849,27 @@ def make_handler(engine: Engine, api_key: str | None):
                 return self._send_error(500, f"generation failed: {type(e).__name__}: {e}",
                                         "server_error")
             return self._send_error(404, f"unknown route {self.path}", "not_found")
+
+        def do_PUT(self):
+            route = self._route()
+            if not self._authed():
+                return self._send_error(401, "invalid api key", "authentication_error")
+            if route != "/admin/model-profiles":
+                return self._send_error(404, f"unknown route {self.path}", "not_found")
+            if not is_pool:
+                return self._send_error(501, "model profiles require --on-demand-models")
+            length = int(self.headers.get("Content-Length", 0) or 0)
+            raw = self.rfile.read(length) if length else b""
+            try:
+                req = json.loads(raw or b"{}")
+            except json.JSONDecodeError as error:
+                return self._send_error(400, f"invalid JSON body: {error}")
+            if not isinstance(req, dict):
+                return self._send_error(400, "JSON body must be an object")
+            try:
+                return self._register_model_profiles(req)
+            except PoolError as error:
+                return self._send_pool_error(error)
 
         # -- payloads --
         def _models_payload(self) -> dict:
@@ -2841,7 +3039,7 @@ def make_handler(engine: Engine, api_key: str | None):
             threading.Thread(target=_heartbeat, daemon=True).start()
 
             def on_text(piece: str):
-                if gone.is_set():
+                if gone.is_set() or (is_pool and engine.is_closing):
                     raise StopStreaming()
                 try:
                     for name, payload in stream.delta(piece):
@@ -3128,7 +3326,7 @@ def make_handler(engine: Engine, api_key: str | None):
             threading.Thread(target=_heartbeat, daemon=True).start()
 
             def _alive():
-                if gone.is_set():
+                if gone.is_set() or (is_pool and engine.is_closing):
                     raise StopStreaming()
 
             try:
@@ -3286,9 +3484,13 @@ def run_server(engine, *, host: str = "127.0.0.1", port: int = 8080,
     base = f"http://{host}:{port}"
     # A --no-model start hands over a model-less EngineHolder; the banner can't dereference
     # engine attributes then (the holder raises a clear "no model" through __getattr__).
-    loaded = not isinstance(engine, EngineHolder) or engine.ready
+    pool_mode = isinstance(engine, ModelPool)
+    loaded = not pool_mode and (not isinstance(engine, EngineHolder) or engine.ready)
     print("=" * 64)
-    if loaded:
+    if pool_mode:
+        print(f"  mlx-dspark server  ·  on-demand model pool ({engine.max_resident} slots)")
+        print("  models load locally on first request; profiles arrive through /admin/model-profiles")
+    elif loaded:
         print(f"  mlx-dspark server  ·  mode={engine.mode}  ·  model={engine.model_id}")
         print(f"  target : {engine.target_repo}")
         if engine.drafter_repo:
@@ -3335,9 +3537,21 @@ def run_server(engine, *, host: str = "127.0.0.1", port: int = 8080,
         print("=" * 64, flush=True)
     else:
         print(flush=True)
+    previous_sigterm = None
+    if threading.current_thread() is threading.main_thread():
+        previous_sigterm = signal.getsignal(signal.SIGTERM)
+
+        def _stop_on_sigterm(_signum, _frame):
+            raise KeyboardInterrupt
+
+        signal.signal(signal.SIGTERM, _stop_on_sigterm)
     try:
         httpd.serve_forever()
     except KeyboardInterrupt:
         print("\nshutting down.")
     finally:
         httpd.server_close()
+        if pool_mode:
+            engine.close()
+        if previous_sigterm is not None:
+            signal.signal(signal.SIGTERM, previous_sigterm)
