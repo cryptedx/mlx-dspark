@@ -2149,14 +2149,11 @@ def make_handler(engine: Engine, api_key: str | None):
                 "pool": status,
             }
             if one is not None:
-                payload.update({
-                    "mode": one["mode"],
-                    "target": one["target"],
-                    "drafter": one["drafter"],
-                    "context_window": one.get("context_window"),
-                    "kv_bits": one.get("kv_bits", 0),
-                    "max_output_tokens": one.get("max_output_tokens"),
-                })
+                payload.update({key: one.get(key) for key in (
+                    "mode", "target", "drafter", "max_draft", "context_window",
+                    "max_output_tokens", "supports_reasoning_effort", "confidence_threshold",
+                    "race_arm_confidence", "lookup_drafts", "kv_bits", "cpu_split",
+                    "thinking_default")})
             return payload
 
         def _sse_start(self):

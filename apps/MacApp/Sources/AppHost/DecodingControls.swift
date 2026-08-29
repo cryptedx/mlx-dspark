@@ -49,8 +49,7 @@ struct DecodingControls: View {
     ]
 
     private var healthForModel: HealthInfo? {
-        guard model.health?.target == model.model else { return nil }
-        return model.health
+        model.selectedHealth
     }
 
     private var confOptions: [String] {
@@ -180,6 +179,7 @@ struct DecodingControls: View {
         // with what was applied.
         .onAppear(perform: syncFromModel)
         .onChange(of: model.model) { _, _ in syncFromModel() }
+        .onChange(of: model.currentHealth) { _, _ in syncFromModel() }
     }
 
     private func syncFromModel() {

@@ -23,12 +23,32 @@ public struct PoolModelStatus: Decodable, Sendable, Equatable, Identifiable {
     public let mode: String?
     public let target: String?
     public let drafter: String?
+    public let maxDraft: String?
+    public let contextWindow: Int?
+    public let maxOutputTokens: Int?
+    public let supportsReasoningEffort: Bool?
+    public let confidenceThreshold: Double?
+    public let raceArmConfidence: Bool?
+    public let lookupDrafts: Bool?
+    public let kvBits: Int?
+    public let cpuSplit: HealthInfo.CPUSplitInfo?
+    public let thinkingDefault: String?
 
     enum CodingKeys: String, CodingKey {
         case model, state, ready, pinned, leases, error, warning, mode, target, drafter
         case restoreError = "restore_error"
         case profilePendingReload = "profile_pending_reload"
         case evictionReason = "eviction_reason"
+        case maxDraft = "max_draft"
+        case contextWindow = "context_window"
+        case maxOutputTokens = "max_output_tokens"
+        case supportsReasoningEffort = "supports_reasoning_effort"
+        case confidenceThreshold = "confidence_threshold"
+        case raceArmConfidence = "race_arm_confidence"
+        case lookupDrafts = "lookup_drafts"
+        case kvBits = "kv_bits"
+        case cpuSplit = "cpu_split"
+        case thinkingDefault = "thinking_default"
     }
 }
 
@@ -133,6 +153,32 @@ public struct HealthInfo: Decodable, Sendable, Equatable {
 
     /// True when a model is loaded and serving (`status == "ok"`).
     public var isLoaded: Bool { status == "ok" }
+}
+
+public extension HealthInfo {
+    /// Rehydrate the selected model's health from its pool slot. The aggregate pool health has
+    /// no implicit current model when several slots are resident.
+    init(poolStatus: PoolModelStatus) {
+        status = poolStatus.ready ? "ok" : poolStatus.state
+        model = poolStatus.model
+        mode = poolStatus.mode
+        target = poolStatus.target
+        drafter = poolStatus.drafter
+        maxDraft = poolStatus.maxDraft
+        contextWindow = poolStatus.contextWindow
+        maxOutputTokens = poolStatus.maxOutputTokens
+        supportsReasoningEffort = poolStatus.supportsReasoningEffort
+        confidenceThreshold = poolStatus.confidenceThreshold
+        raceArmConfidence = poolStatus.raceArmConfidence
+        phase = nil
+        download = nil
+        lookupDrafts = poolStatus.lookupDrafts
+        kvBits = poolStatus.kvBits
+        cpuSplit = poolStatus.cpuSplit
+        warnings = nil
+        thinkingDefault = poolStatus.thinkingDefault
+        pool = nil
+    }
 }
 
 public extension HealthInfo {

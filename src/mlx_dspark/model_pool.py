@@ -850,6 +850,21 @@ class ModelPool:
         return self._evict_one(reason="ttl")
 
     def _slot_status(self, slot: ModelSlot) -> dict:
+        # Pool health is aggregate by design, so expose the effective knobs on each resident
+        # slot. Unloaded slots only have profile values; capability fields stay nil until the
+        # engine exists instead of advertising controls that may not work for that target.
+        profile = slot.profile.options
+        live = slot.engine
+        if live is not None:
+            live = getattr(live, "engine", live)
+        max_draft = (
+            "auto" if getattr(live, "cap_controller", None) is not None
+            else str(getattr(live, "max_draft_tokens", profile.get("max_draft_tokens"))
+                     or "auto")
+        )
+        kv_bits = getattr(getattr(live, "target", None), "kv_bits", None)
+        if kv_bits is None:
+            kv_bits = profile.get("kv_bits") or 0
         return {
             "model": slot.model_id,
             "state": slot.state,
@@ -866,7 +881,22 @@ class ModelPool:
             "mode": slot.prepared.mode if slot.prepared else slot.profile.options.get("mode"),
             "target": slot.prepared.target_repo if slot.prepared else slot.model_id,
             "drafter": slot.prepared.drafter_repo if slot.prepared else None,
-            "context_window": slot.profile.options.get("context_window"),
-            "kv_bits": slot.profile.options.get("kv_bits") or 0,
-            "max_output_tokens": slot.profile.options.get("max_tokens_cap"),
+            "max_draft": max_draft,
+            "context_window": getattr(live, "context_window", profile.get("context_window")),
+            "max_output_tokens": getattr(live, "max_tokens_cap", profile.get("max_tokens_cap")),
+            "supports_reasoning_effort": (
+                bool(getattr(live, "supports_reasoning_effort", False))
+                if live is not None else None
+            ),
+            "confidence_threshold": getattr(
+                live, "confidence_threshold", profile.get("confidence_threshold")
+            ),
+            "race_arm_confidence": True if live is not None else None,
+            "lookup_drafts": getattr(live, "lookup_drafts", profile.get("lookup_drafts")),
+            "kv_bits": kv_bits,
+            "cpu_split": getattr(live, "cpu_split", None) if live is not None else None,
+            "thinking_default": (
+                "off" if getattr(live, "template_defaults", {}).get("enable_thinking") is False
+                else "on"
+            ) if live is not None else None,
         }

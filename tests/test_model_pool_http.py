@@ -45,8 +45,21 @@ class _Runtime:
 
 class _Engine:
     mode = "lookup"
+    max_draft_tokens = 4
+    cap_controller = None
+    confidence_threshold = 0.3
+    lookup_drafts = False
+    context_window = 32768
     max_tokens_cap = 32768
+    cpu_split = None
+    template_defaults = {"enable_thinking": False}
+    supports_reasoning_effort = True
     load_notes = []
+
+    class _Target:
+        kv_bits = 8
+
+    target = _Target()
 
     def close(self):
         return None
@@ -106,6 +119,20 @@ def test_profiles_health_catalog_and_targeted_unload(pool_server):
 
     assert _request(base, "/admin/load", "POST", {"model": "One", "keep_loaded": True})[0] == 200
     assert _request(base, "/admin/load", "POST", {"model": "org/Two", "keep_loaded": True})[0] == 200
+
+    status, health = _request(base, "/health")
+    assert status == 200 and health["model"] is None
+    slots = {slot["model"]: slot for slot in health["pool"]["models"]}
+    assert {name for name, slot in slots.items() if slot["ready"]} == {"org/One", "org/Two"}
+    for slot in slots.values():
+        assert slot["max_draft"] == "4"
+        assert slot["context_window"] == 32768
+        assert slot["max_output_tokens"] == 32768
+        assert slot["confidence_threshold"] == 0.3
+        assert slot["lookup_drafts"] is False
+        assert slot["kv_bits"] == 8
+        assert slot["supports_reasoning_effort"] is True
+        assert slot["thinking_default"] == "off"
 
     status, body = _request(base, "/admin/unload", "POST", {})
     assert status == 400 and body["error"]["code"] == "model_required"

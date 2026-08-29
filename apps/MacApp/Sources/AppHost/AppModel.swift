@@ -456,7 +456,7 @@ final class AppModel: ObservableObject {
     func restartEngine() async {
         guard !isModelLoading else { return }
         let activeSettings = Defaults.modelSettings(for: model)
-            ?? currentHealth.map(ModelSettings.init)
+            ?? selectedHealth.map(ModelSettings.init)
         logStore.note("restarting engine")
         await supervisor?.stop()
         await startServer(model: model, preserving: activeSettings)
@@ -798,7 +798,7 @@ final class AppModel: ObservableObject {
         logStore.note("reloading \(model) — mode \(mode ?? "auto") · cap \(cap ?? "auto")"
                       + (confidence.map { " · conf \($0)" } ?? ""))
         let previousSettings = Defaults.modelSettings(for: model)
-            ?? currentHealth.map(ModelSettings.init)
+            ?? selectedHealth.map(ModelSettings.init)
         let nextSettings = ModelSettings(
             mode: mode ?? previousSettings?.mode ?? "auto",
             maxDraft: cap ?? previousSettings?.maxDraft ?? "auto",
@@ -1243,6 +1243,15 @@ final class AppModel: ObservableObject {
         poolModelStatuses.first { $0.model == target || $0.target == target }
     }
 
+    /// Health for the selected target. Pool `/health` is aggregate by design, so the selected
+    /// slot is the only truthful source for model-dependent controls.
+    var selectedHealth: HealthInfo? {
+        guard let aggregate = health else { return nil }
+        guard aggregate.pool != nil else { return aggregate }
+        guard let status = poolStatus(for: model), status.ready else { return nil }
+        return HealthInfo(poolStatus: status)
+    }
+
     /// The selected ready slot when possible; otherwise the one model currently serving.
     /// `/health.model` is intentionally nil when a two-slot pool is full.
     var activePoolStatus: PoolModelStatus? {
@@ -1273,7 +1282,7 @@ final class AppModel: ObservableObject {
 
     /// Whether the loaded model's chat template reads `reasoning_effort` (`/health` reports
     /// it), so the chat settings only show an effort picker where it does something.
-    var supportsReasoningEffort: Bool { health?.supportsReasoningEffort ?? false }
+    var supportsReasoningEffort: Bool { selectedHealth?.supportsReasoningEffort ?? false }
 
     /// Which strategies can be raced with the currently loaded pair. `baseline` and `lookup`
     /// need only the target; a drafter mode needs the drafter this engine was loaded with, so
@@ -1307,7 +1316,7 @@ final class AppModel: ObservableObject {
     /// longest id first — so a local path like `…/models/Qwen3.8-27B-8bit` still finds its
     /// row and the Decoding picker keeps offering the pair's drafter mode.
     private var loadedModelRow: ModelRow? {
-        guard let target = activeModelTarget else { return nil }
+        guard let target = selectedHealth?.target ?? activeModelTarget else { return nil }
         let base = (target as NSString).lastPathComponent.lowercased()
         let baseNoDash = base.replacingOccurrences(of: "-", with: "")
         return models
@@ -1335,7 +1344,7 @@ final class AppModel: ObservableObject {
     /// "Running dspark · cap 4" — what the decode knobs are currently doing.
     var decodingLine: String {
         var line = "Running \(activeModelMode ?? "—")"
-        if let cap = health?.maxDraft { line += " · cap \(cap)" }
+        if let cap = selectedHealth?.maxDraft { line += " · cap \(cap)" }
         return line
     }
 

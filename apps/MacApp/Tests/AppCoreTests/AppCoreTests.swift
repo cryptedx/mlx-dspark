@@ -208,15 +208,31 @@ struct HealthInfoTests {
         "model":null,"error":null,"max_resident_models":2,"idle_ttl_seconds":900,
         "models":[
           {"model":"vendor/aux","state":"ready","ready":true,"pinned":false,
-           "leases":0,"profile_pending_reload":false,"mode":"lookup","target":"vendor/aux"},
+           "leases":0,"profile_pending_reload":false,"mode":"lookup","target":"vendor/aux",
+           "max_draft":"auto","context_window":32768,"max_output_tokens":32768,
+           "supports_reasoning_effort":true,"confidence_threshold":0.3,
+           "race_arm_confidence":true,"lookup_drafts":false,"kv_bits":8,
+           "thinking_default":"off"},
           {"model":"vendor/selected","state":"ready","ready":true,"pinned":true,
-           "leases":1,"profile_pending_reload":false,"mode":"dspark","target":"vendor/selected"}
+           "leases":1,"profile_pending_reload":false,"mode":"dspark","target":"vendor/selected",
+           "max_draft":"4","context_window":65536,"max_output_tokens":32768,
+           "supports_reasoning_effort":true,"confidence_threshold":0.3,
+           "race_arm_confidence":true,"lookup_drafts":false,"kv_bits":8,
+           "thinking_default":"off"}
         ]}}
         """#
         let health = try JSONDecoder().decode(HealthInfo.self, from: Data(json.utf8))
         #expect(health.model == nil)
         #expect(health.hasLoadedModel)
-        #expect(health.readyPoolModel(preferred: "vendor/selected")?.model == "vendor/selected")
+        let slot = try #require(health.readyPoolModel(preferred: "vendor/selected"))
+        #expect(slot.model == "vendor/selected")
+        let selected = HealthInfo(poolStatus: slot)
+        #expect(selected.maxDraft == "4")
+        #expect(selected.contextWindow == 65536)
+        #expect(selected.lookupDrafts == false)
+        #expect(selected.kvBits == 8)
+        #expect(selected.supportsReasoningEffort == true)
+        #expect(selected.thinkingDefault == "off")
     }
 }
 
